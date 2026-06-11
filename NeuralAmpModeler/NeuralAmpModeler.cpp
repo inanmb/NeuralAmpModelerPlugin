@@ -1,4 +1,5 @@
 #include <algorithm> // std::clamp, std::min
+#include <chrono>
 #include <cmath> // pow
 #include <filesystem>
 #include <iostream>
@@ -108,6 +109,14 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     ->InitEnum("Offline Filter Phase", 0, {"Min Phase IIR", "Min Phase FIR", "Polyphase FIR", "Linear Phase FIR"});
   GetParam(kEQPostNAM)->InitBool("EQ Post", true);
   GetParam(kChannelMode)->InitEnum("Channel Mode", 0, {"Mono", "Stereo"});
+  // Model slots
+  for (int i = 0; i < kNumModelSlots; i++)
+  {
+    GetParam(kCallSlot1 + i)->InitBool(("CallSlot" + std::to_string(i + 1)).c_str(), false);
+    GetParam(kAssignSlot1 + i)->InitBool(("AssignSlot" + std::to_string(i + 1)).c_str(), false);
+  }
+
+  mSlotWorkerThread = std::thread([this]() { _SlotWorkerFunc(); });
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
 
@@ -208,6 +217,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     auto loadModelCompletionHandler = [&](const WDL_String& fileName, const WDL_String& path) {
       if (fileName.GetLength())
       {
+        std::lock_guard<std::mutex> lock(mStageMutex);
         // Sets mNAMPath and mStagedNAM
         const std::string msg = _StageModel(fileName);
         // TODO error messages like the IR loader.
@@ -216,6 +226,11 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
           std::stringstream ss;
           ss << "Failed to load NAM model. Message:\n\n" << msg;
           _ShowMessageBox(GetUI(), ss.str().c_str(), "Failed to load model!", kMB_OK);
+        }
+        else
+        {
+          mActiveSlot.store(0);
+          _SyncCallSlotBooleans(0);
         }
         std::cout << "Loaded: " << fileName.Get() << std::endl;
       }
@@ -361,6 +376,13 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
+  {
+    std::lock_guard<std::mutex> lock(mSlotWorkerMutex);
+    mSlotWorkerStop = true;
+  }
+  mSlotWorkerCV.notify_one();
+  if (mSlotWorkerThread.joinable())
+    mSlotWorkerThread.join();
   _DeallocateIOPointers();
 }
 
@@ -548,6 +570,44 @@ bool NeuralAmpModeler::SerializeState(IByteChunk& chunk) const
   // when we unserialize)
   chunk.PutStr(mNAMPath.Get());
   chunk.PutStr(mIRPath.Get());
+  // Write individual param values in the same order _GetConfigFrom_1_2_1 expects.
+  {
+    const char* names[] = {"Input", "Threshold", "Bass", "Middle", "Treble", "Output",
+                           "NoiseGateActive", "ToneStack", "IRToggle", "CalibrateInput",
+                           "InputCalibrationLevel", "OutputMode", "Slim",
+                           "Oversampling", "Filter Phase", "Offline Oversampling",
+                           "EQ Post", "Channel Mode", "Offline Filter Phase"};
+    for (auto name : names)
+    {
+      for (int i = 0; i < kNumParams; i++)
+      {
+        const IParam* p = GetParam(i);
+        if (strcmp(p->GetName(), name) == 0)
+        {
+          double v = p->Value();
+          chunk.Put(&v);
+          break;
+        }
+      }
+    }
+  }
+  // Slot data is framed by a tag so that older builds that don't know about
+  // slots can safely skip it when loading a state saved by this build.
+  WDL_String slotsTag("###Slots###");
+  chunk.PutStr(slotsTag.Get());
+  for (int i = 0; i < kNumModelSlots; i++)
+  {
+    const SlotState& s = mSlots[i];
+    chunk.PutStr(s.namPath.Get());
+    chunk.PutStr(s.irPath.Get());
+    nlohmann::json j;
+    j["assigned"] = s.assigned;
+    j["irToggle"] = s.irToggle;
+    j["params"] = s.params;
+    const std::string jStr = j.dump();
+    WDL_String wj(jStr.c_str());
+    chunk.PutStr(wj.Get());
+  }
   return SerializeParams(chunk);
 }
 
@@ -641,7 +701,29 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
       break;
     case kEQPostNAM: mEQPostNAM = GetParam(kEQPostNAM)->Bool(); break;
     case kChannelMode: _SetStereoProcessingFromParam(); break;
-    default: break;
+    default:
+      if (!mSlotParamGuard.load())
+      {
+        if (paramIdx >= kCallSlot1 && paramIdx <= kCallSlot10)
+        {
+          const int slotNum = paramIdx - kCallSlot1 + 1;
+          if ((int)GetParam(paramIdx)->Value() == 1)
+          {
+            mSlotLoadRequest.store(slotNum);
+            mSlotWorkerCV.notify_one();
+          }
+        }
+        else if (paramIdx >= kAssignSlot1 && paramIdx <= kAssignSlot10)
+        {
+          if ((int)GetParam(paramIdx)->Value() == 1)
+          {
+            const int slotNum = paramIdx - kAssignSlot1 + 1;
+            mSlotAssignRequest.store(slotNum);
+            mSlotWorkerCV.notify_one();
+          }
+        }
+      }
+      break;
   }
 }
 
@@ -1055,6 +1137,124 @@ void NeuralAmpModeler::_SetStereoProcessingFromParam()
   mStereoProcessing = _IsStereoRequested();
 }
 
+void NeuralAmpModeler::_SetSlotParamValue(int paramIdx, int value)
+{
+  mSlotParamGuard.store(true);
+  SetParameterValue(paramIdx, GetParam(paramIdx)->ToNormalized((double)value));
+  mSlotParamGuard.store(false);
+}
+
+void NeuralAmpModeler::_SyncCallSlotBooleans(int activeSlot)
+{
+  for (int i = 1; i <= kNumModelSlots; i++)
+    _SetSlotParamValue(kCallSlot1 + i - 1, i == activeSlot ? 1 : 0);
+}
+
+void NeuralAmpModeler::_SlotWorkerFunc()
+{
+  while (true)
+  {
+    {
+      std::unique_lock<std::mutex> lock(mSlotWorkerMutex);
+      mSlotWorkerCV.wait(lock, [this]() {
+        return mSlotWorkerStop || mSlotLoadRequest.load() > 0 || mSlotAssignRequest.load() > 0;
+      });
+      if (mSlotWorkerStop)
+        return;
+    }
+    // Brief debounce so that a burst of parameter changes (e.g. a host
+    // preset switch) settles before we act on the last request.
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    try { _ProcessSlotRequests(); }
+    catch (...) {}
+  }
+}
+
+void NeuralAmpModeler::_ProcessSlotRequests()
+{
+  // Assignment first: "assign then select" in the same wake-up works correctly.
+  const int assign = mSlotAssignRequest.exchange(0);
+  if (assign >= 1 && assign <= kNumModelSlots)
+  {
+    SlotState& s = mSlots[assign - 1];
+    s.namPath = mNAMPath;
+    s.irPath = mIRPath;
+    s.irToggle = (bool)GetParam(kIRToggle)->Value();
+    s.params.clear();
+    // Capture all params except the slot-control params
+    for (int i = 0; i < kNumParams; i++)
+    {
+      if ((i >= kCallSlot1 && i <= kCallSlot10) || (i >= kAssignSlot1 && i <= kAssignSlot10))
+        continue;
+      s.params[GetParam(i)->GetName()] = GetParam(i)->Value();
+    }
+    s.assigned = true;
+    mActiveSlot.store(assign);
+    _SyncCallSlotBooleans(assign);
+    mSlotLoadRequest.store(0);
+    // Reset the button so it can be used again
+    _SetSlotParamValue(kAssignSlot1 + assign - 1, 0);
+  }
+
+  const int req = mSlotLoadRequest.exchange(0);
+  if (req <= 0)
+    return;
+  const int active = mActiveSlot.load();
+  if (req == active)
+    return;
+
+  const SlotState& s = mSlots[req - 1];
+  if (!s.assigned)
+  {
+    // Empty slot — nothing to do.
+    _SyncCallSlotBooleans(active);
+    return;
+  }
+
+  // Check NAM file exists
+  bool namOk = s.namPath.GetLength() > 0;
+  if (namOk)
+  {
+    try { namOk = std::filesystem::exists(std::filesystem::u8path(s.namPath.Get())); }
+    catch (...) { namOk = false; }
+  }
+  if (!namOk)
+  {
+    _SyncCallSlotBooleans(active);
+    return;
+  }
+
+  // Load NAM if different
+  bool ok = true;
+  if (strcmp(s.namPath.Get(), mNAMPath.Get()) != 0)
+  {
+    std::lock_guard<std::mutex> lock(mStageMutex);
+    ok = _StageModel(s.namPath).empty();
+  }
+
+  // Load IR if different
+  if (ok && strcmp(s.irPath.Get(), mIRPath.Get()) != 0)
+  {
+    if (s.irPath.GetLength())
+      _StageIR(s.irPath);
+    else
+    {
+      mShouldRemoveIR = true;
+      mIRPath.Set("");
+    }
+  }
+
+  if (ok)
+  {
+    mActiveSlot.store(req);
+    _SyncCallSlotBooleans(req);
+  }
+  else
+  {
+    _SyncCallSlotBooleans(active);
+  }
+}
+
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
   WDL_String previousNAMPath = mNAMPath;
@@ -1074,7 +1274,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, loadedNAMPath.GetLength(),
                                loadedNAMPath.Get());
   }
-  catch (std::runtime_error& e)
+  catch (std::exception& e)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
 
@@ -1087,6 +1287,13 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
     return e.what();
+  }
+  catch (...)
+  {
+    SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
+    mStagedModel = nullptr;
+    mNAMPath = previousNAMPath;
+    return "Unknown error loading DSP module";
   }
   return "";
 }
