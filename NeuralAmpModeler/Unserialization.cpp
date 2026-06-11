@@ -22,6 +22,9 @@
 
 void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
 {
+  // Suppress OnParamChange slot triggers during param restore.
+  mSlotParamGuard.store(true);
+
   auto getParamByName = [&](std::string& name) {
     // Could use a map but eh
     for (int i = 0; i < kNumParams; i++)
@@ -56,6 +59,47 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
 
   mNAMPath.Set(static_cast<std::string>(config["NAMPath"]).c_str());
   mIRPath.Set(static_cast<std::string>(config["IRPath"]).c_str());
+
+  // Model slots
+  for (int i = 0; i < kNumModelSlots; i++)
+  {
+    SlotState& s = mSlots[i];
+    const std::string namKey = "SlotNAMPath" + std::to_string(i);
+    const std::string irKey  = "SlotIRPath"  + std::to_string(i);
+    const std::string jsonKey = "SlotJSON"   + std::to_string(i);
+    if (config.contains(namKey))
+    {
+      s.namPath.Set(static_cast<std::string>(config[namKey]).c_str());
+      s.irPath.Set(config.contains(irKey) ? static_cast<std::string>(config[irKey]).c_str() : "");
+      s.irToggle = true;
+      s.params.clear();
+      s.assigned = false;
+      if (config.contains(jsonKey))
+      {
+        try
+        {
+          nlohmann::json j = nlohmann::json::parse(static_cast<std::string>(config[jsonKey]));
+          s.assigned = j.value("assigned", false);
+          s.irToggle = j.value("irToggle", true);
+          if (j.contains("params"))
+            s.params = j["params"].get<std::unordered_map<std::string, double>>();
+        }
+        catch (...) {}
+      }
+    }
+    else
+    {
+      s.namPath.Set("");
+      s.irPath.Set("");
+      s.irToggle = true;
+      s.params.clear();
+      s.assigned = false;
+    }
+  }
+  mActiveSlot.store(0);
+  mSlotLoadRequest.store(0);
+  mSlotAssignRequest.store(0);
+  mSlotParamGuard.store(false);
 
   if (mNAMPath.GetLength())
   {
@@ -97,11 +141,38 @@ void _RenameKeys(nlohmann::json& j, std::unordered_map<std::string, std::string>
   }
 }
 
+// Reads slot data written by SerializeState if the ###Slots### tag is present.
+// Returns updated pos. If the tag is absent, slots are left empty (legacy save).
+int _TryReadSlots(const iplug::IByteChunk& chunk, int pos, nlohmann::json& config)
+{
+  WDL_String tag;
+  const int posAfterTag = chunk.GetStr(tag, pos);
+  if (strcmp(tag.Get(), "###Slots###") != 0)
+    return pos; // no slot data — leave pos unchanged
+
+  pos = posAfterTag;
+  for (int i = 0; i < kNumModelSlots; i++)
+  {
+    WDL_String namPath, irPath, jsonStr;
+    pos = chunk.GetStr(namPath, pos);
+    pos = chunk.GetStr(irPath, pos);
+    pos = chunk.GetStr(jsonStr, pos);
+    config["SlotNAMPath" + std::to_string(i)] = std::string(namPath.Get());
+    config["SlotIRPath"  + std::to_string(i)] = std::string(irPath.Get());
+    config["SlotJSON"    + std::to_string(i)] = std::string(jsonStr.Get());
+  }
+  return pos;
+}
+
 // v0.7.14
 
-void _UpdateConfigFrom_0_7_14(nlohmann::json& config)
+void _AddMissingSlotParams(nlohmann::json& config)
 {
-  // Fill me in once something changes!
+  for (int i = 1; i <= kNumModelSlots; i++)
+  {
+    config["CallSlot"   + std::to_string(i)] = 0.0;
+    config["AssignSlot" + std::to_string(i)] = 0.0;
+  }
 }
 
 int _GetConfigFrom_0_7_14(const iplug::IByteChunk& chunk, int startPos, nlohmann::json& config)
@@ -121,17 +192,12 @@ int _GetConfigFrom_0_7_14(const iplug::IByteChunk& chunk, int startPos, nlohmann
                                       "Slim"};
 
   int pos = _UnserializePathsAndExpectedKeys(chunk, startPos, config, paramNames);
-  _UpdateConfigFrom_0_7_14(config);
+  pos = _TryReadSlots(chunk, pos, config);
+  _AddMissingSlotParams(config);
   return pos;
 }
 
 // v0.7.12
-
-void _UpdateConfigFrom_0_7_12(nlohmann::json& config)
-{
-  config["Slim"] = 1.0;
-  _UpdateConfigFrom_0_7_14(config);
-}
 
 int _GetConfigFrom_0_7_12(const iplug::IByteChunk& chunk, int startPos, nlohmann::json& config)
 {
@@ -149,43 +215,30 @@ int _GetConfigFrom_0_7_12(const iplug::IByteChunk& chunk, int startPos, nlohmann
                                       "OutputMode"};
 
   int pos = _UnserializePathsAndExpectedKeys(chunk, startPos, config, paramNames);
-  // Then update:
-  _UpdateConfigFrom_0_7_12(config);
+  config["Slim"] = 1.0;
+  pos = _TryReadSlots(chunk, pos, config);
+  _AddMissingSlotParams(config);
   return pos;
 }
 
 // 0.7.10
-
-void _UpdateConfigFrom_0_7_10(nlohmann::json& config)
-{
-  // Note: "OutNorm" is Bool-like in v0.7.10, but "OutputMode" is enum.
-  // This works because 0 is "Raw" (cf OutNorm false) and 1 is "Calibrated" (cf OutNorm true).
-  std::unordered_map<std::string, std::string> newNames{{"OutNorm", "OutputMode"}};
-  _RenameKeys(config, newNames);
-  // There are new parameters. If they're not included, then 0.7.12 is ok, but future ones might not be.
-  config[kCalibrateInputParamName] = (double)kDefaultCalibrateInput;
-  config[kInputCalibrationLevelParamName] = kDefaultInputCalibrationLevel;
-  _UpdateConfigFrom_0_7_12(config);
-}
 
 int _GetConfigFrom_0_7_10(const iplug::IByteChunk& chunk, int startPos, nlohmann::json& config)
 {
   std::vector<std::string> paramNames{
     "Input", "Threshold", "Bass", "Middle", "Treble", "Output", "NoiseGateActive", "ToneStack", "OutNorm", "IRToggle"};
   int pos = _UnserializePathsAndExpectedKeys(chunk, startPos, config, paramNames);
-  // Then update:
-  _UpdateConfigFrom_0_7_10(config);
+  std::unordered_map<std::string, std::string> newNames{{"OutNorm", "OutputMode"}};
+  _RenameKeys(config, newNames);
+  config[kCalibrateInputParamName] = (double)kDefaultCalibrateInput;
+  config[kInputCalibrationLevelParamName] = kDefaultInputCalibrationLevel;
+  config["Slim"] = 1.0;
+  pos = _TryReadSlots(chunk, pos, config);
+  _AddMissingSlotParams(config);
   return pos;
 }
 
 // Earlier than 0.7.10 (Assumed to be 0.7.3-0.7.9)
-
-void _UpdateConfigFrom_Earlier(nlohmann::json& config)
-{
-  std::unordered_map<std::string, std::string> newNames{{"Gate", "Threshold"}};
-  _RenameKeys(config, newNames);
-  _UpdateConfigFrom_0_7_10(config);
-}
 
 int _GetConfigFrom_Earlier(const iplug::IByteChunk& chunk, int startPos, nlohmann::json& config)
 {
@@ -193,8 +246,13 @@ int _GetConfigFrom_Earlier(const iplug::IByteChunk& chunk, int startPos, nlohman
     "Input", "Gate", "Bass", "Middle", "Treble", "Output", "NoiseGateActive", "ToneStack", "OutNorm", "IRToggle"};
 
   int pos = _UnserializePathsAndExpectedKeys(chunk, startPos, config, paramNames);
-  // Then update:
-  _UpdateConfigFrom_Earlier(config);
+  std::unordered_map<std::string, std::string> newNames{{"Gate", "Threshold"}, {"OutNorm", "OutputMode"}};
+  _RenameKeys(config, newNames);
+  config[kCalibrateInputParamName] = (double)kDefaultCalibrateInput;
+  config[kInputCalibrationLevelParamName] = kDefaultInputCalibrationLevel;
+  config["Slim"] = 1.0;
+  pos = _TryReadSlots(chunk, pos, config);
+  _AddMissingSlotParams(config);
   return pos;
 }
 

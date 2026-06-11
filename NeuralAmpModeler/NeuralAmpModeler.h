@@ -1,5 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
 #include "../AudioDSPTools/dsp/dsp.h"
@@ -47,8 +52,33 @@ enum EParams
   kInputCalibrationLevel,
   kOutputMode,
   kSlim,
+  // Model slots
+  // Call: press button N to load slot N (radio behaviour)
+  kCallSlot1,
+  kCallSlot2,
+  kCallSlot3,
+  kCallSlot4,
+  kCallSlot5,
+  kCallSlot6,
+  kCallSlot7,
+  kCallSlot8,
+  kCallSlot9,
+  kCallSlot10,
+  // Assign: press button N to save current full state into slot N (auto-resets to 0)
+  kAssignSlot1,
+  kAssignSlot2,
+  kAssignSlot3,
+  kAssignSlot4,
+  kAssignSlot5,
+  kAssignSlot6,
+  kAssignSlot7,
+  kAssignSlot8,
+  kAssignSlot9,
+  kAssignSlot10,
   kNumParams
 };
+
+const int kNumModelSlots = 10;
 
 const int numKnobs = 6;
 
@@ -236,6 +266,18 @@ private:
   // it wasn't successful.
   dsp::wav::LoadReturnCode _StageIR(const WDL_String& irPath);
 
+  // === Model slots ===
+  // Background worker: processes pending slot load/assign requests so that
+  // model switching works even when the plugin UI is closed.
+  void _SlotWorkerFunc();
+  // Process one round of pending slot requests (called from _SlotWorkerFunc).
+  void _ProcessSlotRequests();
+  // Sync kCallSlot1-10 to reflect activeSlot, and inform the host.
+  void _SyncCallSlotBooleans(int activeSlot);
+  // Set a slot-related parameter value and inform the host, without
+  // re-triggering a slot request (guarded by mSlotParamGuard).
+  void _SetSlotParamValue(int paramIdx, int value);
+
   bool _HaveModel() const { return this->mModel != nullptr; };
   // Prepare the input & output buffers
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames);
@@ -316,6 +358,34 @@ private:
 
   // Path to model's config.json or model.nam
   WDL_String mNAMPath;
+
+  // === Model slots ===
+  struct SlotState
+  {
+    WDL_String namPath;
+    WDL_String irPath;
+    bool irToggle = true;
+    std::unordered_map<std::string, double> params; // param name → value
+    bool assigned = false;
+  };
+  SlotState mSlots[kNumModelSlots];
+  // Pending requests written from OnParamChange (any thread).
+  // 0 = no request. Consumed by the worker thread.
+  std::atomic<int> mSlotLoadRequest{0};
+  std::atomic<int> mSlotAssignRequest{0};
+  // Slot currently providing the loaded model. 0 = manual (file browser).
+  std::atomic<int> mActiveSlot{0};
+  // True while the plugin is writing slot parameters internally, to suppress
+  // re-entrant requests from OnParamChange.
+  std::atomic<bool> mSlotParamGuard{false};
+  // Mutex that serialises concurrent calls to _StageModel (file browser
+  // lambda vs worker thread).
+  std::mutex mStageMutex;
+  // Worker thread for slot loading.
+  std::thread mSlotWorkerThread;
+  std::mutex mSlotWorkerMutex;
+  std::condition_variable mSlotWorkerCV;
+  bool mSlotWorkerStop = false;
   // Path to IR (.wav file)
   WDL_String mIRPath;
 
