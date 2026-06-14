@@ -3,7 +3,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
@@ -19,9 +21,7 @@
 #include "ISender.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <mutex>
 
 
 const int kNumPresets = 1;
