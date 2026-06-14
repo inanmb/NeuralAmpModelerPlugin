@@ -18,6 +18,10 @@
 
 // Add new unserialization versions to the top, then add logic to the class method at the bottom.
 
+// Forward declarations for helpers defined later in this file.
+static int _TryReadSlots(const iplug::IByteChunk& chunk, int pos, nlohmann::json& config);
+static void _AddMissingSlotParams(nlohmann::json& config);
+
 // Boilerplate
 
 void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
@@ -297,7 +301,7 @@ int _GetConfigFrom_1_1_0(const iplug::IByteChunk& chunk, int startPos, nlohmann:
 
 // Reads slot data written by SerializeState if the ###Slots### tag is present.
 // Returns updated pos. If the tag is absent, slots are left empty (legacy save).
-int _TryReadSlots(const iplug::IByteChunk& chunk, int pos, nlohmann::json& config)
+static int _TryReadSlots(const iplug::IByteChunk& chunk, int pos, nlohmann::json& config)
 {
   WDL_String tag;
   const int posAfterTag = chunk.GetStr(tag, pos);
@@ -320,7 +324,7 @@ int _TryReadSlots(const iplug::IByteChunk& chunk, int pos, nlohmann::json& confi
 
 // v0.7.14
 
-void _AddMissingSlotParams(nlohmann::json& config)
+static void _AddMissingSlotParams(nlohmann::json& config)
 {
   // Add oversampling/stereo defaults for states saved before these features existed.
   if (!config.contains("Oversampling"))
