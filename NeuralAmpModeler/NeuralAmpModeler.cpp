@@ -933,7 +933,8 @@ void NeuralAmpModeler::_ProcessSlotRequests()
     s.assigned = true;
     mActiveSlot.store(assign);
     _SyncCallSlotBooleans(assign);
-    mSlotLoadRequest.store(0);
+    if (mSlotLoadRequest.load() > 0)
+      mSlotLoadRequest.store(0);
     // Reset the button so it can be used again
     _SetSlotParamValue(kAssignSlot1 + assign - 1, 0);
   }
