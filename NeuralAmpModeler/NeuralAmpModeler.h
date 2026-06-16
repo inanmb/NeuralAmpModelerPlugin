@@ -308,8 +308,9 @@ private:
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
 
-  // Polyphase (oversampling) helper
+  // Polyphase (oversampling) helpers
   void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
+  void _EnsurePhaseBuffers(int N, int framesPerPhase);
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -410,23 +411,29 @@ private:
 
   NAMSender mInputSender, mOutputSender;
 
-  // === Polyphase oversampling (single model at N×Fs) ===
+  // === Polyphase oversampling (N raw DSPs at Fs, OpenMP parallelism) ===
   // Metadata model (ResamplingNAM, 1 when N>1) — NOT in the audio path.
   std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
   std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
-  // Single raw DSP for audio processing at N×Fs. Empty = use mModel (1x path).
+  // N raw DSPs for audio processing at Fs, one per phase. Empty = use mModel (1x path).
   std::vector<std::unique_ptr<nam::DSP>> mRawPhaseModels;
   std::vector<std::unique_ptr<nam::DSP>> mStagedRawPhaseModels;
   // Set to true (release) only after staged vectors are fully populated.
   std::atomic<bool> mPhaseModelsReady{false};
 
-  // Oversampling factor for the active/staged raw model.
+  // Oversampling factor for the active/staged raw models.
   int mActivePolyphaseN = 1;
   int mStagedPolyphaseN = 1;
+
+  // Per-phase scratch buffers (NAM_SAMPLE, one channel each).
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseInputBufs;
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutputBufs;
+  std::vector<NAM_SAMPLE*> mPhaseInputPtrs;
+  std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
 
   // Shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples at Fs.
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
-  std::vector<double> mPolyUpBuf;         // N×nFrames upsampled buffer (double)
-  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch (1x and N×Fs paths)
+  std::vector<double> mPolyUpBuf;   // N×nFrames upsampled buffer (double)
+  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
 };
