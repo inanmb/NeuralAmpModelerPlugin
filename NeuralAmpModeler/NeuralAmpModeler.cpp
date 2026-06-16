@@ -759,8 +759,9 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     _SetInputGain();
     _SetOutputGain();
   }
-  if (!mStagedPhaseModels.empty())
+  if (mPhaseModelsReady.load(std::memory_order_acquire) && !mStagedPhaseModels.empty())
   {
+    mPhaseModelsReady.store(false, std::memory_order_relaxed);
     NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models\n", (int)mStagedPhaseModels.size());
     mModel = nullptr;
     _StopPhaseWorkers();
@@ -1095,14 +1096,21 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       nlohmann::json j;
       f >> j;
       const auto scaledJson = _ScaleDilationsInJson(j, N);
-      mStagedPhaseModels.clear();
+      // Build into a local vector first — the audio thread must not see a partial result.
+      std::vector<std::unique_ptr<ResamplingNAM>> newPhaseModels;
+      newPhaseModels.reserve(N);
       for (int p = 0; p < N; p++)
-        mStagedPhaseModels.push_back(wrapModel(nam::get_dsp(scaledJson)));
+        newPhaseModels.push_back(wrapModel(nam::get_dsp(scaledJson)));
+      // Swap atomically: clear ready flag, assign, then set flag with release ordering.
+      mPhaseModelsReady.store(false, std::memory_order_relaxed);
+      mStagedPhaseModels = std::move(newPhaseModels);
+      mPhaseModelsReady.store(true, std::memory_order_release);
       mStagedModel = nullptr;
     }
     else
     {
       mStagedModel = wrapModel(nam::get_dsp(dspPath));
+      mPhaseModelsReady.store(false, std::memory_order_relaxed);
       mStagedPhaseModels.clear();
     }
 
@@ -1113,6 +1121,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
     mStagedModel = nullptr;
+    mPhaseModelsReady.store(false, std::memory_order_relaxed);
     mStagedPhaseModels.clear();
     mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
@@ -1123,6 +1132,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
     mStagedModel = nullptr;
+    mPhaseModelsReady.store(false, std::memory_order_relaxed);
     mStagedPhaseModels.clear();
     mNAMPath = previousNAMPath;
     return "Unknown error loading DSP module";

@@ -413,6 +413,9 @@ private:
   // N independent model instances (one per phase). Empty = use mModel instead.
   std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
   std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
+  // Set to true (release) only after mStagedPhaseModels is fully populated.
+  // Audio thread checks this (acquire) before consuming the vector.
+  std::atomic<bool> mPhaseModelsReady{false};
   // Per-phase scratch buffers (single channel)
   std::vector<std::vector<iplug::sample>> mPhaseInputBufs;
   std::vector<std::vector<iplug::sample>> mPhaseOutputBufs;
