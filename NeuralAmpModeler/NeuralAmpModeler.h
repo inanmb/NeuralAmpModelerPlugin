@@ -12,6 +12,7 @@
 #include "../AudioDSPTools/dsp/ResamplingContainer/ResamplingContainer.h"
 #include "../NeuralAmpModelerCore/NAM/dsp.h"
 #include "../NeuralAmpModelerCore/NAM/slimmable.h"
+#include "../iPlug2/IPlug/Extras/LanczosResampler.h"
 
 #include "Colors.h"
 #include "ToneStack.h"
@@ -286,7 +287,7 @@ private:
   // re-triggering a slot request (guarded by mSlotParamGuard).
   void _SetSlotParamValue(int paramIdx, int value);
 
-  bool _HaveModel() const { return this->mModel != nullptr || !this->mPhaseModels.empty(); };
+  bool _HaveModel() const { return this->mModel != nullptr || !this->mRawPhaseModels.empty(); };
   // Prepare the input & output buffers
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames);
   // Manage pointers
@@ -413,11 +414,16 @@ private:
   NAMSender mInputSender, mOutputSender;
 
   // === Polyphase oversampling / multicore ===
-  // N independent model instances (one per phase). Empty = use mModel instead.
+  // Metadata model (ResamplingNAM, size 1 when N>1) — NOT in the audio path,
+  // used only to expose Loudness / InputLevel / SlimmableModel to the UI.
   std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
   std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
-  // Set to true (release) only after mStagedPhaseModels is fully populated.
-  // Audio thread checks this (acquire) before consuming the vector.
+  // Raw DSP instances for actual audio processing (N instances, one per phase).
+  // Empty = use mModel (single-model path) instead.
+  std::vector<std::unique_ptr<nam::DSP>> mRawPhaseModels;
+  std::vector<std::unique_ptr<nam::DSP>> mStagedRawPhaseModels;
+  // Set to true (release) only after staged vectors are fully populated.
+  // Audio thread checks this (acquire) before consuming them.
   std::atomic<bool> mPhaseModelsReady{false};
   // Per-phase scratch buffers (single channel)
   std::vector<std::vector<iplug::sample>> mPhaseInputBufs;
@@ -425,14 +431,11 @@ private:
   std::vector<iplug::sample*> mPhaseInputPtrs;
   std::vector<iplug::sample*> mPhaseOutputPtrs;
 
-  // Lanczos polyphase filter (anti-imaging upsampling + symmetric output delay)
-  // A=52 → group delay ≈ 52 samples (upsampling) + 52 samples (output ring) ≈ 104 samples total
+  // Shared Lanczos upsampler (Fs → N×Fs). Initialized when N>1, null otherwise.
+  // Group delay ≈ A = kPolyphaseA samples at Fs.
   static constexpr int kPolyphaseA = 52;
-  std::vector<double> mLanczosHistory;            // 2*kPolyphaseA past input samples
-  std::vector<std::vector<double>> mLanczosCoeffs; // [N][2*kPolyphaseA] per-phase filter taps
-  std::vector<double> mOutputDelayRing;            // kPolyphaseA-sample ring buffer for output delay
-  int mOutputDelayPos = 0;
-  void _PrecomputeLanczosCoeffs(int N);
+  std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
+  std::vector<double> mPolyUpBuf; // N×nFrames upsampled buffer
 
   struct PhaseWorker
   {
@@ -442,7 +445,7 @@ private:
     iplug::sample** input = nullptr;
     iplug::sample** output = nullptr;
     int numFrames = 0;
-    ResamplingNAM* model = nullptr;
+    nam::DSP* model = nullptr;
     // Wake worker
     std::mutex workMtx;
     std::condition_variable workCV;
