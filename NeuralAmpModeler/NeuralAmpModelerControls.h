@@ -765,13 +765,43 @@ public:
     const auto titleArea = GetRECT().GetPadded(-(pad + 10.0f)).GetFromTop(50.0f);
     AddNamedChildControl(new IVLabelControl(titleArea, "SETTINGS", titleStyle), mControlNames.title);
 
-    // Attach input/output calibration controls
+    const float sectionWidth = titleArea.W();
+
+    // Oversampling + Multicore section (right below title, like Gateway OS)
     {
+      const float osMCHeight = 55.0f;
+      const auto osMCArea = titleArea.GetFromBottom(osMCHeight).GetTranslated(0.0f, osMCHeight);
+      const auto osArea = osMCArea.GetFromLeft(0.6f * sectionWidth).GetPadded(-4.0f);
+      const auto mcArea = osMCArea.GetFromRight(0.4f * sectionWidth).GetPadded(-4.0f);
+
+      const auto osLabelArea = osArea.GetFromTop(18.0f);
+      AddNamedChildControl(new IVLabelControl(osLabelArea, "Oversampling",
+                             style.WithValueText(IText(12, EAlign::Center, PluginColors::HELP_TEXT))),
+                           mControlNames.osLabel);
+      const auto osRadioArea = osArea.GetReducedFromTop(18.0f);
+      const float btnSize = 8.0f;
+      AddNamedChildControl(
+        new IVRadioButtonControl(osRadioArea, kOversamplingFactor, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"},
+                                 "OversamplingFactor", mRadioButtonStyle, EVShape::Ellipse, EDirection::Horizontal, btnSize),
+        mControlNames.osRadio, kCtrlTagOversamplingControl);
+
+      const auto mcLabelArea = mcArea.GetFromTop(18.0f);
+      AddNamedChildControl(new IVLabelControl(mcLabelArea, "Multicore",
+                             style.WithValueText(IText(12, EAlign::Center, PluginColors::HELP_TEXT))),
+                           mControlNames.mcLabel);
+      const auto mcSwitchArea = mcArea.GetReducedFromTop(18.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
+      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "Multicore", mStyle, mSwitchBitmap),
+                           mControlNames.mcSwitch, kCtrlTagMulticoreControl);
+    }
+
+    // Attach input/output calibration controls (below OS/MC section)
+    {
+      const float osMCHeight = 55.0f;
+      const auto osMCBottom = titleArea.GetFromBottom(osMCHeight).GetTranslated(0.0f, osMCHeight);
       const float height = NAM_KNOB_HEIGHT + NAM_SWTICH_HEIGHT + 10.0f;
-      const float width = titleArea.W();
-      const auto inputOutputArea = titleArea.GetFromBottom(height).GetTranslated(0.0f, height);
-      const auto inputArea = inputOutputArea.GetFromLeft(0.5f * width);
-      const auto outputArea = inputOutputArea.GetFromRight(0.5f * width);
+      const auto inputOutputArea = osMCBottom.GetFromBottom(height).GetTranslated(0.0f, height);
+      const auto inputArea = inputOutputArea.GetFromLeft(0.5f * sectionWidth);
+      const auto outputArea = inputOutputArea.GetFromRight(0.5f * sectionWidth);
 
       const float knobWidth = 87.0f; // HACK based on looking at the main page knobs.
       const auto inputLevelArea =
@@ -788,9 +818,8 @@ public:
         new NAMSwitchControl(inputSwitchArea, kCalibrateInput, "Calibrate Input", mStyle, mSwitchBitmap),
         mControlNames.calibrateInput, kCtrlTagCalibrateInput);
 
-      // Same-ish height & width as input controls
       const auto outputRadioArea = outputArea.GetFromBottom(
-        1.1f * (inputLevelArea.H() + inputSwitchArea.H())); // .GetMidHPadded(0.55f * knobWidth);
+        1.1f * (inputLevelArea.H() + inputSwitchArea.H()));
       const float buttonSize = 10.0f;
       auto* outputModeControl =
         AddNamedChildControl(new OutputModeControl(outputRadioArea, kOutputMode, mRadioButtonStyle, buttonSize),
@@ -798,36 +827,6 @@ public:
       outputModeControl->SetTooltip(
         "How to adjust the level of the output.\nRaw=No adjustment.\nNormalized=Adjust the level so that all models "
         "are about the same loudness.\nCalibrated=Match the input's digital-analog calibration.");
-    }
-
-    // Oversampling factor radio buttons + multicore toggle
-    {
-      const float sectionHeight = 80.0f;
-      const auto settingsArea = GetRECT().GetPadded(-pad).GetFromBottom(sectionHeight + 78.0f).GetFromTop(sectionHeight);
-      const float halfW = settingsArea.W() * 0.5f;
-      const auto osArea = settingsArea.GetFromLeft(halfW).GetPadded(-4.0f);
-      const auto mcArea = settingsArea.GetFromRight(halfW).GetPadded(-4.0f);
-
-      // Label
-      const auto osLabelArea = osArea.GetFromTop(18.0f);
-      AddNamedChildControl(new IVLabelControl(osLabelArea, "OVERSAMPLING",
-                             style.WithValueText(IText(12, EAlign::Near, PluginColors::HELP_TEXT))),
-                           mControlNames.osLabel);
-      const auto osRadioArea = osArea.GetReducedFromTop(18.0f);
-      const float btnSize = 8.0f;
-      AddNamedChildControl(
-        new IVRadioButtonControl(osRadioArea, kOversamplingFactor, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"},
-                                 "OversamplingFactor", mRadioButtonStyle, EVShape::Ellipse, EDirection::Horizontal, btnSize),
-        mControlNames.osRadio, kCtrlTagOversamplingControl);
-
-      // Multicore toggle
-      const auto mcLabelArea = mcArea.GetFromTop(18.0f);
-      AddNamedChildControl(new IVLabelControl(mcLabelArea, "MULTICORE",
-                             style.WithValueText(IText(12, EAlign::Near, PluginColors::HELP_TEXT))),
-                           mControlNames.mcLabel);
-      const auto mcSwitchArea = mcArea.GetReducedFromTop(18.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
-      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "Multicore", mStyle, mSwitchBitmap),
-                           mControlNames.mcSwitch, kCtrlTagMulticoreControl);
     }
 
     const float halfWidth = PLUG_WIDTH / 2.0f - pad;
