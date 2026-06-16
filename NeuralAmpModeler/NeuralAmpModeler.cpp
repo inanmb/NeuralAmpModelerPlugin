@@ -1055,13 +1055,17 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
     if (N > 1)
     {
-      // Polyphase decomposition: N model instances, each processes every Nth sample.
-      // Effective temporal dilation = d*N in original time — no JSON scaling needed.
+      // Gateway OS approach: N polyphase instances, each with dilations scaled ×N.
+      // Each instance processes every Nth sample → CPU scales with N, sound transparent.
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
+      std::ifstream f(dspPath);
+      nlohmann::json j;
+      f >> j;
+      const auto scaledJson = _ScaleDilationsInJson(j, N);
       mStagedPhaseModels.clear();
       for (int p = 0; p < N; p++)
-        mStagedPhaseModels.push_back(wrapModel(nam::get_dsp(dspPath)));
+        mStagedPhaseModels.push_back(wrapModel(nam::get_dsp(scaledJson)));
       mStagedModel = nullptr;
     }
     else
