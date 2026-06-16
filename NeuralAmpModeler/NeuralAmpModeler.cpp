@@ -784,11 +784,34 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mRawPhaseModels = std::move(mStagedRawPhaseModels);
     mStagedPhaseModels.clear();
     mStagedRawPhaseModels.clear();
-    mPolyUpBuf.clear();
-    // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
+
+    // Pre-allocate upsampler buffer and phase scratch buffers now to eliminate
+    // any heap allocation during ProcessBlock.
+    const int blockSize = GetBlockSize();
     const double Fs = GetSampleRate();
+    mPolyUpBuf.assign((size_t)(N * blockSize), 0.0);
+    mPhaseInputBufs.resize(N);
+    mPhaseOutputBufs.resize(N);
+    mPhaseInputPtrs.resize(N);
+    mPhaseOutputPtrs.resize(N);
+    for (int p = 0; p < N; p++)
+    {
+      mPhaseInputBufs[p].assign((size_t)blockSize, 0.0f);
+      mPhaseOutputBufs[p].assign((size_t)blockSize, 0.0f);
+      mPhaseInputPtrs[p] = mPhaseInputBufs[p].data();
+      mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
+    }
+
+    // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
+
+    // Warm up the OpenMP thread pool so the first audio block doesn't pay
+    // thread-creation cost. The parallel region is a no-op work-wise.
+    #pragma omp parallel for schedule(static) num_threads(N)
+    for (int p = 0; p < N; p++)
+      (void)p;
+
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
