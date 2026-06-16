@@ -767,46 +767,46 @@ public:
 
     const float sectionWidth = titleArea.W();
 
-    // Oversampling + Multicore section (right below title, like Gateway OS)
+    // Oversampling + Multicore section (right below title)
+    const float osMCHeight = 50.0f;
+    const auto osMCArea = titleArea.GetFromBottom(osMCHeight).GetTranslated(0.0f, osMCHeight);
     {
-      const float osMCHeight = 55.0f;
-      const auto osMCArea = titleArea.GetFromBottom(osMCHeight).GetTranslated(0.0f, osMCHeight);
       const auto osArea = osMCArea.GetFromLeft(0.6f * sectionWidth).GetPadded(-4.0f);
       const auto mcArea = osMCArea.GetFromRight(0.4f * sectionWidth).GetPadded(-4.0f);
 
-      const auto osLabelArea = osArea.GetFromTop(18.0f);
+      const auto osLabelArea = osArea.GetFromTop(16.0f);
       AddNamedChildControl(new IVLabelControl(osLabelArea, "Oversampling",
                              style.WithValueText(IText(12, EAlign::Center, PluginColors::HELP_TEXT))),
                            mControlNames.osLabel);
-      const auto osRadioArea = osArea.GetReducedFromTop(18.0f);
+      const auto osRadioArea = osArea.GetReducedFromTop(16.0f);
       const float btnSize = 8.0f;
       AddNamedChildControl(
         new IVRadioButtonControl(osRadioArea, kOversamplingFactor, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"},
-                                 "OversamplingFactor", mRadioButtonStyle, EVShape::Ellipse, EDirection::Horizontal, btnSize),
+                                 "", mRadioButtonStyle, EVShape::Ellipse, EDirection::Horizontal, btnSize),
         mControlNames.osRadio, kCtrlTagOversamplingControl);
 
-      const auto mcLabelArea = mcArea.GetFromTop(18.0f);
+      const auto mcLabelArea = mcArea.GetFromTop(16.0f);
       AddNamedChildControl(new IVLabelControl(mcLabelArea, "Multicore",
                              style.WithValueText(IText(12, EAlign::Center, PluginColors::HELP_TEXT))),
                            mControlNames.mcLabel);
-      const auto mcSwitchArea = mcArea.GetReducedFromTop(18.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
-      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "Multicore", mStyle, mSwitchBitmap),
+      const auto mcSwitchArea = mcArea.GetReducedFromTop(16.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
+      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "", mStyle, mSwitchBitmap),
                            mControlNames.mcSwitch, kCtrlTagMulticoreControl);
     }
 
-    // Attach input/output calibration controls (below OS/MC section)
+    // Attach input/output calibration controls (compact, right below OS/MC section)
     {
-      const float osMCHeight = 55.0f;
-      const auto osMCBottom = titleArea.GetFromBottom(osMCHeight).GetTranslated(0.0f, osMCHeight);
-      const float height = NAM_KNOB_HEIGHT + NAM_SWTICH_HEIGHT + 10.0f;
-      const auto inputOutputArea = osMCBottom.GetFromBottom(height).GetTranslated(0.0f, height);
+      const float calibTop = osMCArea.B + 8.0f;
+      const float levelH = 28.0f;
+      const float switchH = 32.0f;
+      const float calibH = levelH + switchH + 8.0f;
+      const auto inputOutputArea = IRECT{osMCArea.L, calibTop, osMCArea.R, calibTop + calibH};
       const auto inputArea = inputOutputArea.GetFromLeft(0.5f * sectionWidth);
       const auto outputArea = inputOutputArea.GetFromRight(0.5f * sectionWidth);
 
-      const float knobWidth = 87.0f; // HACK based on looking at the main page knobs.
-      const auto inputLevelArea =
-        inputArea.GetFromTop(NAM_KNOB_HEIGHT).GetFromBottom(25.0f).GetMidHPadded(0.5f * knobWidth);
-      const auto inputSwitchArea = inputArea.GetFromBottom(NAM_SWTICH_HEIGHT).GetMidHPadded(0.5f * knobWidth);
+      const float knobWidth = 87.0f;
+      const auto inputLevelArea = inputArea.GetFromTop(levelH).GetMidHPadded(0.5f * knobWidth);
+      const auto inputSwitchArea = inputArea.GetFromBottom(switchH).GetMidHPadded(0.5f * knobWidth);
 
       auto* inputLevelControl = AddNamedChildControl(
         new InputLevelControl(inputLevelArea, kInputCalibrationLevel, mInputLevelBackgroundBitmap, text),
@@ -818,8 +818,7 @@ public:
         new NAMSwitchControl(inputSwitchArea, kCalibrateInput, "Calibrate Input", mStyle, mSwitchBitmap),
         mControlNames.calibrateInput, kCtrlTagCalibrateInput);
 
-      const auto outputRadioArea = outputArea.GetFromBottom(
-        1.1f * (inputLevelArea.H() + inputSwitchArea.H()));
+      const auto outputRadioArea = outputArea.GetFromBottom(1.1f * (levelH + switchH));
       const float buttonSize = 10.0f;
       auto* outputModeControl =
         AddNamedChildControl(new OutputModeControl(outputRadioArea, kOutputMode, mRadioButtonStyle, buttonSize),
