@@ -388,15 +388,7 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   }
   else if (mModel != nullptr)
   {
-    if (mOversamplingContainer)
-    {
-      auto processFunc = [&](NAM_SAMPLE** in, NAM_SAMPLE** out, int n) { mModel->process(in, out, n); };
-      mOversamplingContainer->ProcessBlock(triggerOutput, mOutputPointers, nFrames, processFunc);
-    }
-    else
-    {
-      mModel->process(triggerOutput, mOutputPointers, nFrames);
-    }
+    mModel->process(triggerOutput, mOutputPointers, nFrames);
   }
   else
   {
@@ -712,7 +704,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mShouldRemoveModel)
   {
     mModel = nullptr;
-    mOversamplingContainer.reset();
     _StopPhaseWorkers();
     mPhaseModels.clear();
     mNAMPath.Set("");
@@ -736,22 +727,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
 
-    // Set up (or tear down) the oversampling container.
-    // The outer ResamplingContainer upsamples by N, so the model receives up to N*hostBlockSize frames.
-    const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-    if (N > 1)
-    {
-      const double hostRate = GetSampleRate();
-      const int hostBlockSize = GetBlockSize();
-      mModel->Reset(hostRate * N, hostBlockSize * N);
-      mOversamplingContainer = std::make_unique<dsp::ResamplingContainer<NAM_SAMPLE, 1, 12>>(hostRate * N);
-      mOversamplingContainer->Reset(hostRate, hostBlockSize);
-    }
-    else
-    {
-      mOversamplingContainer.reset();
-    }
-
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
@@ -760,7 +735,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (!mStagedPhaseModels.empty())
   {
     mModel = nullptr;
-    mOversamplingContainer.reset(); // polyphase path has no outer oversampling container
     _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
     mStagedPhaseModels.clear();
@@ -815,16 +789,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
   }
   else if (mModel != nullptr)
   {
-    if (mOversamplingContainer)
-    {
-      const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-      mModel->Reset(sampleRate * N, maxBlockSize * N);
-      mOversamplingContainer->Reset(sampleRate, maxBlockSize);
-    }
-    else
-    {
-      mModel->Reset(sampleRate, maxBlockSize);
-    }
+    mModel->Reset(sampleRate, maxBlockSize);
   }
   for (auto& pm : mStagedPhaseModels)
     if (pm) pm->Reset(sampleRate, maxBlockSize);
@@ -1046,6 +1011,27 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 }
 
+// Scale all WaveNet dilation values in a .nam JSON by factor N (Gateway OS approach).
+// Combined with per-sample polyphase interleaving, this maintains the correct temporal
+// receptive field: each thread sees every N-th sample, scaled dilations compensate.
+static nlohmann::json _ScaleDilationsInJson(const nlohmann::json& j, int factor)
+{
+  if (factor <= 1)
+    return j;
+  auto scaled = j;
+  if (scaled.value("architecture", "") == "WaveNet")
+  {
+    auto& layers = scaled["config"]["layers"];
+    for (auto& layer : layers)
+    {
+      auto& dilations = layer["dilations"];
+      for (auto& d : dilations)
+        d = d.get<int>() * factor;
+    }
+  }
+  return scaled;
+}
+
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
   WDL_String previousNAMPath = mNAMPath;
@@ -1054,8 +1040,6 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
-    // Helper: validate and wrap a nam::DSP into ResamplingNAM at host sample rate.
-    // For oversampling (N>1, multicore OFF), the model will be re-Reset at N×rate in _ApplyDSPStaging.
     auto wrapModel = [&](std::unique_ptr<nam::DSP> model) -> std::unique_ptr<ResamplingNAM> {
       if (model->NumInputChannels() != 1)
         throw std::runtime_error("Model must have 1 input channel, but has "
@@ -1070,9 +1054,29 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       return wrapped;
     };
 
-    // Always single-model path. Oversampling container (if N>1) is set up in _ApplyDSPStaging.
-    mStagedModel = wrapModel(nam::get_dsp(dspPath));
-    mStagedPhaseModels.clear();
+    if (N > 1)
+    {
+      // Polyphase path: N models each with dilations×N.
+      // Thread p processes samples p, p+N, p+2N... Dilation scaling maintains temporal receptive field.
+      // Multicore toggle determines threading; DSP result is identical either way.
+      if (!std::filesystem::exists(dspPath))
+        throw std::runtime_error("Config file doesn't exist!\n");
+      std::ifstream f(dspPath);
+      nlohmann::json j;
+      f >> j;
+      const auto scaledJson = _ScaleDilationsInJson(j, N);
+      std::vector<std::unique_ptr<ResamplingNAM>> phases;
+      phases.reserve(N);
+      for (int p = 0; p < N; p++)
+        phases.push_back(wrapModel(nam::get_dsp(scaledJson)));
+      mStagedPhaseModels = std::move(phases);
+      mStagedModel = nullptr;
+    }
+    else
+    {
+      mStagedModel = wrapModel(nam::get_dsp(dspPath));
+      mStagedPhaseModels.clear();
+    }
 
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
@@ -1283,8 +1287,6 @@ void NeuralAmpModeler::_UpdateLatency()
     latency += mModel->GetLatency();
   else if (!mPhaseModels.empty())
     latency += mPhaseModels[0]->GetLatency();
-  if (mOversamplingContainer)
-    latency += mOversamplingContainer->GetLatency();
 
   // Feels weird to have to do this.
   if (GetLatency() != latency)

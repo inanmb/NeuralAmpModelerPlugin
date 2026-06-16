@@ -439,8 +439,4 @@ private:
     bool done = true;
   };
   std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
-
-  // Outer oversampling container — wraps mModel when oversampling factor > 1 and multicore is OFF.
-  // Null otherwise.
-  std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, 12>> mOversamplingContainer;
 };
