@@ -592,8 +592,12 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kOversamplingFactor:
       // Reload the model with new dilation scaling.
       // Guard check avoids spurious reload during preset recall / unserialization.
+      fprintf(stderr, "[NAM] kOversamplingFactor changed: guard=%d pathLen=%d N=%d\n",
+              (int)mSlotParamGuard.load(), (int)mNAMPath.GetLength(),
+              kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
       if (!mSlotParamGuard.load() && mNAMPath.GetLength())
       {
+        fprintf(stderr, "[NAM] Requesting model reload for oversampling\n");
         mSlotLoadRequest.store(-1);
         mSlotWorkerCV.notify_one();
       }
@@ -734,6 +738,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   }
   if (!mStagedPhaseModels.empty())
   {
+    fprintf(stderr, "[NAM] _ApplyDSPStaging: activating %d phase models\n", (int)mStagedPhaseModels.size());
     mModel = nullptr;
     _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
@@ -941,6 +946,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 
   const int req = mSlotLoadRequest.exchange(0);
+  fprintf(stderr, "[NAM] _ProcessSlotRequests: req=%d namPathLen=%d\n", req, (int)mNAMPath.GetLength());
   if (req == 0)
     return;
   // -1 = reload current model with updated oversampling factor
@@ -948,8 +954,11 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   {
     if (mNAMPath.GetLength())
     {
+      fprintf(stderr, "[NAM] Staging model with N=%d\n",
+              kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
       std::lock_guard<std::mutex> lock(mStageMutex);
       _StageModel(mNAMPath);
+      fprintf(stderr, "[NAM] _StageModel done, stagedPhaseModels=%d\n", (int)mStagedPhaseModels.size());
     }
     return;
   }
