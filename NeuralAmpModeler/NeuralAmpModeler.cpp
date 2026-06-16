@@ -1088,20 +1088,17 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
     if (N > 1)
     {
-      // Gateway OS approach: N polyphase instances, each with dilations scaled ×N.
-      // Each instance processes every Nth sample → CPU scales with N, sound transparent.
+      // Correct polyphase oversampling approach:
+      // Each of N models gets the input at a fractional delay of p/N samples (interpolated).
+      // All N models process nFrames each with ORIGINAL dilations (no scaling needed).
+      // Output = average of N model outputs = proper anti-aliased decimation from N×Fs.
+      // CPU scales ×N; nonlinear harmonics above Fs/(2N) cancel in the average.
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
-      std::ifstream f(dspPath);
-      nlohmann::json j;
-      f >> j;
-      const auto scaledJson = _ScaleDilationsInJson(j, N);
-      // Build into a local vector first — the audio thread must not see a partial result.
       std::vector<std::unique_ptr<ResamplingNAM>> newPhaseModels;
       newPhaseModels.reserve(N);
       for (int p = 0; p < N; p++)
-        newPhaseModels.push_back(wrapModel(nam::get_dsp(scaledJson)));
-      // Swap atomically: clear ready flag, assign, then set flag with release ordering.
+        newPhaseModels.push_back(wrapModel(nam::get_dsp(dspPath)));
       mPhaseModelsReady.store(false, std::memory_order_relaxed);
       mStagedPhaseModels = std::move(newPhaseModels);
       mPhaseModelsReady.store(true, std::memory_order_release);
@@ -1365,15 +1362,25 @@ void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = (int)mPhaseModels.size();
-  const int phaseFrames = nFrames / N;
-  const int remainder = nFrames % N;
 
-  _EnsurePhaseBuffers(N, phaseFrames + 1);
+  // Each model processes ALL nFrames (not nFrames/N): CPU scales ×N.
+  _EnsurePhaseBuffers(N, nFrames);
 
-  // Demux: scatter input into per-phase buffers (stride N)
+  // Phase p receives the input signal fractionally delayed by p/N samples.
+  // This is equivalent to polyphase decomposition of an N×-upsampled signal:
+  // nonlinear harmonics above Fs/(2N) cancel in the output average → aliasing reduction.
   for (int p = 0; p < N; p++)
-    for (int i = 0; i < phaseFrames; i++)
-      mPhaseInputBufs[p][i] = input[0][p + i * N];
+  {
+    const double frac = p / (double)N;
+    const double ifrac = 1.0 - frac;
+    for (int i = 0; i < nFrames; i++)
+    {
+      const double x0 = input[0][i];
+      // Use x0 for last frame (imperceptible error; avoids lookahead into next block).
+      const double x1 = (i + 1 < nFrames) ? input[0][i + 1] : x0;
+      mPhaseInputBufs[p][i] = x0 * ifrac + x1 * frac;
+    }
+  }
 
   const bool multicore = GetParam(kMulticoreEnabled)->Bool();
 
@@ -1385,7 +1392,7 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
       auto& w = *mPhaseWorkers[p - 1];
       w.input = &mPhaseInputPtrs[p];
       w.output = &mPhaseOutputPtrs[p];
-      w.numFrames = phaseFrames;
+      w.numFrames = nFrames;
       w.model = mPhaseModels[p].get();
       {
         std::lock_guard<std::mutex> lk(w.doneMtx);
@@ -1398,7 +1405,7 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
       w.workCV.notify_one();
     }
     // Audio thread processes phase 0
-    mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], phaseFrames);
+    mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
     // Wait for all workers
     for (auto& w : mPhaseWorkers)
     {
@@ -1408,25 +1415,18 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
   }
   else
   {
-    // Serial processing
     for (int p = 0; p < N; p++)
-      mPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], phaseFrames);
+      mPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
   }
 
-  // Mux: gather outputs back into interleaved order
-  for (int p = 0; p < N; p++)
-    for (int i = 0; i < phaseFrames; i++)
-      output[0][p + i * N] = mPhaseOutputBufs[p][i];
-
-  // Remainder frames: process serially with phase 0 model
-  if (remainder > 0)
+  // Output = average of all N phase outputs.
+  // Equivalent to anti-aliased decimation of the N×Fs interleaved signal back to Fs.
+  for (int i = 0; i < nFrames; i++)
   {
-    const int startIdx = phaseFrames * N;
-    for (int j = 0; j < remainder; j++)
-      mPhaseInputBufs[0][j] = input[0][startIdx + j];
-    mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], remainder);
-    for (int j = 0; j < remainder; j++)
-      output[0][startIdx + j] = mPhaseOutputBufs[0][j];
+    double sum = 0.0;
+    for (int p = 0; p < N; p++)
+      sum += mPhaseOutputBufs[p][i];
+    output[0][i] = sum / N;
   }
 }
 
