@@ -435,7 +435,9 @@ private:
   // Group delay ≈ A = kPolyphaseA samples at Fs.
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
-  std::vector<double> mPolyUpBuf; // N×nFrames upsampled buffer
+  std::vector<double> mPolyUpBuf;  // N×nFrames upsampled input buffer
+  std::vector<double> mPolyOutBuf; // N×nFrames model output buffer
+  int mPolyN = 1; // Current oversampling factor (updated in _ApplyDSPStaging)
 
   struct PhaseWorker
   {
