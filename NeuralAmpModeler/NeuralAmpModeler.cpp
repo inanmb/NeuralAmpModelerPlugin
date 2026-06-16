@@ -367,7 +367,6 @@ NeuralAmpModeler::~NeuralAmpModeler()
   mSlotWorkerCV.notify_one();
   if (mSlotWorkerThread.joinable())
     mSlotWorkerThread.join();
-  _StopPhaseWorkers();
   _DeallocateIOPointers();
 }
 
@@ -742,10 +741,10 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mShouldRemoveModel)
   {
     mModel = nullptr;
-    _StopPhaseWorkers();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mPolyUpsampler.reset();
+    mActivePolyphaseN = 1;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
     mModelCleared = true;
@@ -762,10 +761,10 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
-    _StopPhaseWorkers();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mPolyUpsampler.reset();
+    mActivePolyphaseN = 1;
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
 
@@ -777,10 +776,10 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mPhaseModelsReady.load(std::memory_order_acquire) && !mStagedRawPhaseModels.empty())
   {
     mPhaseModelsReady.store(false, std::memory_order_relaxed);
-    const int N = (int)mStagedRawPhaseModels.size();
-    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models\n", N);
+    mActivePolyphaseN = mStagedPolyphaseN;
+    const int N = mActivePolyphaseN;
+    NAM_LOG("[NAM] _ApplyDSPStaging: activating single model at %dx (Fs=%.0f)\n", N, GetSampleRate());
     mModel = nullptr;
-    _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
     mRawPhaseModels = std::move(mStagedRawPhaseModels);
     mStagedPhaseModels.clear();
@@ -790,9 +789,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     const double Fs = GetSampleRate();
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
-    // Start worker threads for phases 1..N-1
-    if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
-      _StartPhaseWorkers(N - 1);
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
@@ -847,12 +843,12 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
   for (auto& pm : mPhaseModels)
     if (pm) pm->Reset(sampleRate, maxBlockSize);
   for (auto& pm : mStagedRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
+    if (pm) pm->ResetAndPrewarm(mStagedPolyphaseN * sampleRate, mStagedPolyphaseN * maxBlockSize);
   for (auto& pm : mRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
+    if (pm) pm->ResetAndPrewarm(mActivePolyphaseN * sampleRate, mActivePolyphaseN * maxBlockSize);
   if (mPolyUpsampler && !mRawPhaseModels.empty())
   {
-    const int N = (int)mRawPhaseModels.size();
+    const int N = mActivePolyphaseN;
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)sampleRate, (float)(N * sampleRate));
     mPolyUpBuf.clear();
@@ -1130,24 +1126,22 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
 
-      // N raw DSP instances for the audio path (no internal rate-conversion overhead).
+      // Single raw DSP at N×Fs — processes N×nFrames per block in one GEMM call.
+      auto raw = nam::get_dsp(dspPath);
+      if (raw->NumInputChannels() != 1 || raw->NumOutputChannels() != 1)
+        throw std::runtime_error("Model must have exactly 1 input and 1 output channel");
+      raw->ResetAndPrewarm(N * GetSampleRate(), N * GetBlockSize());
+      if (auto* s = dynamic_cast<nam::SlimmableModel*>(raw.get()))
+        s->SetSlimmableSize(GetParam(kSlim)->Value());
+
       std::vector<std::unique_ptr<nam::DSP>> newRawModels;
-      newRawModels.reserve(N);
-      for (int p = 0; p < N; p++)
-      {
-        auto raw = nam::get_dsp(dspPath);
-        if (raw->NumInputChannels() != 1 || raw->NumOutputChannels() != 1)
-          throw std::runtime_error("Model must have exactly 1 input and 1 output channel");
-        raw->ResetAndPrewarm(GetSampleRate(), GetBlockSize());
-        if (auto* s = dynamic_cast<nam::SlimmableModel*>(raw.get()))
-          s->SetSlimmableSize(GetParam(kSlim)->Value());
-        newRawModels.push_back(std::move(raw));
-      }
+      newRawModels.push_back(std::move(raw));
 
       // 1 ResamplingNAM for metadata only (Loudness, InputLevel, SlimmableModel queries).
       std::vector<std::unique_ptr<ResamplingNAM>> newPhaseModels;
       newPhaseModels.push_back(wrapModel(nam::get_dsp(dspPath)));
 
+      mStagedPolyphaseN = N;
       mPhaseModelsReady.store(false, std::memory_order_relaxed);
       mStagedPhaseModels = std::move(newPhaseModels);
       mStagedRawPhaseModels = std::move(newRawModels);
@@ -1394,131 +1388,42 @@ void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPoint
   mOutputSender.ProcessBlock(outputPointer, (int)nFrames, kCtrlTagOutputMeter, nChansHack);
 }
 
-void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
-{
-  if ((int)mPhaseInputBufs.size() != N)
-  {
-    mPhaseInputBufs.resize(N);
-    mPhaseOutputBufs.resize(N);
-    mPhaseInputPtrs.resize(N);
-    mPhaseOutputPtrs.resize(N);
-  }
-  for (int p = 0; p < N; p++)
-  {
-    if ((int)mPhaseInputBufs[p].size() < framesPerPhase)
-      mPhaseInputBufs[p].resize(framesPerPhase, 0.0);
-    if ((int)mPhaseOutputBufs[p].size() < framesPerPhase)
-      mPhaseOutputBufs[p].resize(framesPerPhase, 0.0);
-    mPhaseInputPtrs[p] = mPhaseInputBufs[p].data();
-    mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
-  }
-}
-
 
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
-  const int N = (int)mRawPhaseModels.size();
-  _EnsurePhaseBuffers(N, nFrames);
-
-  // 1. Upsample input: Fs → N×Fs via shared LanczosResampler.
-  //    Group delay ≈ kPolyphaseA samples at Fs.
+  const int N = mActivePolyphaseN;
   const int upLen = N * nFrames;
+
+  // 1. Upsample Fs → N×Fs.
   if ((int)mPolyUpBuf.size() < upLen)
     mPolyUpBuf.assign(upLen, 0.0);
-
   mPolyUpsampler->PushBlock(input, (size_t)nFrames);
   {
     double* ptr = mPolyUpBuf.data();
     const size_t popped = mPolyUpsampler->PopBlock(&ptr, (size_t)upLen);
-    // Zero-pad during startup transient (first block only, inaudible).
     if ((int)popped < upLen)
       std::fill(mPolyUpBuf.begin() + popped, mPolyUpBuf.begin() + upLen, 0.0);
   }
 
-  // 2. Stride demux: phase p gets upsampled samples at indices p, N+p, 2N+p, ...
-  for (int p = 0; p < N; p++)
-    for (int i = 0; i < nFrames; i++)
-      mPhaseInputBufs[p][i] = mPolyUpBuf[i * N + p];
+  // 2. Convert double → NAM_SAMPLE for model input.
+  if ((int)mModelInF.size() < upLen) mModelInF.resize(upLen);
+  if ((int)mModelOutF.size() < upLen) mModelOutF.resize(upLen);
+  for (int i = 0; i < upLen; i++) mModelInF[i] = static_cast<NAM_SAMPLE>(mPolyUpBuf[i]);
 
-  // 3. Model processing (multicore or serial).
-  const bool multicore = GetParam(kMulticoreEnabled)->Bool();
-  if (multicore && (int)mPhaseWorkers.size() == N - 1)
-  {
-    for (int p = 1; p < N; p++)
-    {
-      auto& w = *mPhaseWorkers[p - 1];
-      w.input = &mPhaseInputPtrs[p];
-      w.output = &mPhaseOutputPtrs[p];
-      w.numFrames = nFrames;
-      w.model = mRawPhaseModels[p].get();
-      {std::lock_guard<std::mutex> lk(w.doneMtx); w.done = false;}
-      {std::lock_guard<std::mutex> lk(w.workMtx); w.workReady = true;}
-      w.workCV.notify_one();
-    }
-    mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
-    for (auto& w : mPhaseWorkers)
-    {
-      std::unique_lock<std::mutex> lk(w->doneMtx);
-      w->doneCV.wait(lk, [&w] { return w->done; });
-    }
-  }
-  else
-  {
-    for (int p = 0; p < N; p++)
-      mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
-  }
+  // 3. Single model processes N×nFrames in one block (full GEMM, best cache utilization).
+  NAM_SAMPLE* inPtr = mModelInF.data();
+  NAM_SAMPLE* outPtr = mModelOutF.data();
+  mRawPhaseModels[0]->process(&inPtr, &outPtr, upLen);
 
-  // 4. Downsample: average the N phase outputs.
-  //    Each model outputs at Fs; their average is the anti-aliased Fs signal.
+  // 4. Decimate: average N consecutive output samples → 1 output sample.
+  const float invN = 1.0f / static_cast<float>(N);
   for (int i = 0; i < nFrames; i++)
   {
-    double sum = 0.0;
-    for (int p = 0; p < N; p++) sum += mPhaseOutputBufs[p][i];
-    output[0][i] = sum / N;
+    float sum = 0.0f;
+    const NAM_SAMPLE* base = mModelOutF.data() + i * N;
+    for (int k = 0; k < N; k++) sum += base[k];
+    output[0][i] = static_cast<iplug::sample>(sum * invN);
   }
-}
-
-void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
-{
-  for (int i = 0; i < numWorkers; i++)
-  {
-    auto w = std::make_unique<PhaseWorker>();
-    w->phaseIdx = i + 1;
-    w->thread = std::thread([wp = w.get(), this]() {
-      while (true)
-      {
-        {
-          std::unique_lock<std::mutex> lk(wp->workMtx);
-          wp->workCV.wait(lk, [wp] { return wp->workReady || wp->quit; });
-          if (wp->quit)
-            break;
-          wp->workReady = false;
-        }
-        wp->model->process(wp->input, wp->output, wp->numFrames);
-        {
-          std::lock_guard<std::mutex> lk(wp->doneMtx);
-          wp->done = true;
-        }
-        wp->doneCV.notify_one();
-      }
-    });
-    mPhaseWorkers.push_back(std::move(w));
-  }
-}
-
-void NeuralAmpModeler::_StopPhaseWorkers()
-{
-  for (auto& w : mPhaseWorkers)
-  {
-    {
-      std::lock_guard<std::mutex> lk(w->workMtx);
-      w->quit = true;
-    }
-    w->workCV.notify_one();
-    if (w->thread.joinable())
-      w->thread.join();
-  }
-  mPhaseWorkers.clear();
 }
 
 // HACK

@@ -308,11 +308,8 @@ private:
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
 
-  // Polyphase (oversampling + multicore) helpers
+  // Polyphase (oversampling) helper
   void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
-  void _StartPhaseWorkers(int numWorkers);
-  void _StopPhaseWorkers();
-  void _EnsurePhaseBuffers(int N, int framesPerPhase);
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -413,49 +410,23 @@ private:
 
   NAMSender mInputSender, mOutputSender;
 
-  // === Polyphase oversampling / multicore ===
-  // Metadata model (ResamplingNAM, size 1 when N>1) — NOT in the audio path,
-  // used only to expose Loudness / InputLevel / SlimmableModel to the UI.
+  // === Polyphase oversampling (single model at N×Fs) ===
+  // Metadata model (ResamplingNAM, 1 when N>1) — NOT in the audio path.
   std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
   std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
-  // Raw DSP instances for actual audio processing (N instances, one per phase).
-  // Empty = use mModel (single-model path) instead.
+  // Single raw DSP for audio processing at N×Fs. Empty = use mModel (1x path).
   std::vector<std::unique_ptr<nam::DSP>> mRawPhaseModels;
   std::vector<std::unique_ptr<nam::DSP>> mStagedRawPhaseModels;
   // Set to true (release) only after staged vectors are fully populated.
-  // Audio thread checks this (acquire) before consuming them.
   std::atomic<bool> mPhaseModelsReady{false};
-  // Per-phase scratch buffers (single channel, NAM_SAMPLE for direct model I/O)
-  std::vector<std::vector<NAM_SAMPLE>> mPhaseInputBufs;
-  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutputBufs;
-  std::vector<NAM_SAMPLE*> mPhaseInputPtrs;
-  std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
 
-  // Shared Lanczos upsampler (Fs → N×Fs). Initialized when N>1, null otherwise.
-  // Group delay ≈ A = kPolyphaseA samples at Fs.
+  // Oversampling factor for the active/staged raw model.
+  int mActivePolyphaseN = 1;
+  int mStagedPolyphaseN = 1;
+
+  // Shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples at Fs.
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
-  std::vector<double> mPolyUpBuf;    // N×nFrames upsampled buffer (double, LanczosResampler)
-  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // float scratch for mModel (N=1) boundary
-
-  struct PhaseWorker
-  {
-    std::thread thread;
-    int phaseIdx = 0;
-    // Work assignment
-    NAM_SAMPLE** input = nullptr;
-    NAM_SAMPLE** output = nullptr;
-    int numFrames = 0;
-    nam::DSP* model = nullptr;
-    // Wake worker
-    std::mutex workMtx;
-    std::condition_variable workCV;
-    bool workReady = false;
-    bool quit = false;
-    // Signal completion
-    std::mutex doneMtx;
-    std::condition_variable doneCV;
-    bool done = true;
-  };
-  std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
+  std::vector<double> mPolyUpBuf;         // N×nFrames upsampled buffer (double)
+  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch (1x and N×Fs paths)
 };
