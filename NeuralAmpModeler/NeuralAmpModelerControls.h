@@ -800,6 +800,36 @@ public:
         "are about the same loudness.\nCalibrated=Match the input's digital-analog calibration.");
     }
 
+    // Oversampling factor radio buttons + multicore toggle
+    {
+      const float sectionHeight = 80.0f;
+      const auto settingsArea = GetRECT().GetPadded(-pad).GetFromBottom(sectionHeight + 78.0f).GetFromTop(sectionHeight);
+      const float halfW = settingsArea.W() * 0.5f;
+      const auto osArea = settingsArea.GetFromLeft(halfW).GetPadded(-4.0f);
+      const auto mcArea = settingsArea.GetFromRight(halfW).GetPadded(-4.0f);
+
+      // Label
+      const auto osLabelArea = osArea.GetFromTop(18.0f);
+      AddNamedChildControl(new IVLabelControl(osLabelArea, "OVERSAMPLING",
+                             style.WithValueText(IText(12, EAlign::Near, PluginColors::HELP_TEXT))),
+                           mControlNames.osLabel);
+      const auto osRadioArea = osArea.GetReducedFromTop(18.0f);
+      const float btnSize = 8.0f;
+      AddNamedChildControl(
+        new IVRadioButtonControl(osRadioArea, kOversamplingFactor, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"},
+                                 "OversamplingFactor", mRadioButtonStyle, EDirection::Horizontal, btnSize),
+        mControlNames.osRadio, kCtrlTagOversamplingControl);
+
+      // Multicore toggle
+      const auto mcLabelArea = mcArea.GetFromTop(18.0f);
+      AddNamedChildControl(new IVLabelControl(mcLabelArea, "MULTICORE",
+                             style.WithValueText(IText(12, EAlign::Near, PluginColors::HELP_TEXT))),
+                           mControlNames.mcLabel);
+      const auto mcSwitchArea = mcArea.GetReducedFromTop(18.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
+      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "Multicore", mStyle, mSwitchBitmap),
+                           mControlNames.mcSwitch, kCtrlTagMulticoreControl);
+    }
+
     const float halfWidth = PLUG_WIDTH / 2.0f - pad;
     const auto bottomArea = GetRECT().GetPadded(-pad).GetFromBottom(78.0f);
     const float lineHeight = 15.0f;
@@ -846,6 +876,10 @@ private:
     const std::string modelInfo = "ModelInfo";
     const std::string outputMode = "OutputMode";
     const std::string title = "Title";
+    const std::string osLabel = "OversamplingLabel";
+    const std::string osRadio = "OversamplingRadio";
+    const std::string mcLabel = "MulticoreLabel";
+    const std::string mcSwitch = "MulticoreSwitch";
   } mControlNames;
 
   class InputLevelControl : public IEditableTextControl

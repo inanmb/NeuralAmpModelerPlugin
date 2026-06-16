@@ -75,10 +75,16 @@ enum EParams
   kAssignSlot8,
   kAssignSlot9,
   kAssignSlot10,
+  // Oversampling / multicore
+  kOversamplingFactor, // 0=Off(1x), 1=2x, 2=3x, 3=4x, 4=8x, 5=16x, 6=32x
+  kMulticoreEnabled,   // bool
   kNumParams
 };
 
 const int kNumModelSlots = 10;
+
+static const int kOversamplingFactorValues[] = {1, 2, 3, 4, 8, 16, 32};
+static const int kNumOversamplingFactors = 7;
 
 const int numKnobs = 6;
 
@@ -95,6 +101,8 @@ enum ECtrlTags
   kCtrlTagSlimmableIcon,
   kCtrlTagSlimOverlayBackdrop,
   kCtrlTagSlimKnob,
+  kCtrlTagOversamplingControl,
+  kCtrlTagMulticoreControl,
   kNumCtrlTags
 };
 
@@ -278,7 +286,7 @@ private:
   // re-triggering a slot request (guarded by mSlotParamGuard).
   void _SetSlotParamValue(int paramIdx, int value);
 
-  bool _HaveModel() const { return this->mModel != nullptr; };
+  bool _HaveModel() const { return this->mModel != nullptr || !this->mPhaseModels.empty(); };
   // Prepare the input & output buffers
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames);
   // Manage pointers
@@ -298,6 +306,12 @@ private:
   void _SetInputGain();
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
+
+  // Polyphase (oversampling + multicore) helpers
+  void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
+  void _StartPhaseWorkers(int numWorkers);
+  void _StopPhaseWorkers();
+  void _EnsurePhaseBuffers(int N, int framesPerPhase);
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -394,4 +408,35 @@ private:
   std::unordered_map<std::string, double> mNAMParams = {{"Input", 0.0}, {"Output", 0.0}};
 
   NAMSender mInputSender, mOutputSender;
+
+  // === Polyphase oversampling / multicore ===
+  // N independent model instances (one per phase). Empty = use mModel instead.
+  std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
+  std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
+  // Per-phase scratch buffers (single channel)
+  std::vector<std::vector<iplug::sample>> mPhaseInputBufs;
+  std::vector<std::vector<iplug::sample>> mPhaseOutputBufs;
+  std::vector<iplug::sample*> mPhaseInputPtrs;
+  std::vector<iplug::sample*> mPhaseOutputPtrs;
+
+  struct PhaseWorker
+  {
+    std::thread thread;
+    int phaseIdx = 0;
+    // Work assignment
+    iplug::sample** input = nullptr;
+    iplug::sample** output = nullptr;
+    int numFrames = 0;
+    ResamplingNAM* model = nullptr;
+    // Wake worker
+    std::mutex workMtx;
+    std::condition_variable workCV;
+    bool workReady = false;
+    bool quit = false;
+    // Signal completion
+    std::mutex doneMtx;
+    std::condition_variable doneCV;
+    bool done = true;
+  };
+  std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
 };

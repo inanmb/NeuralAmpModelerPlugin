@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath> // pow
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <utility>
 
@@ -101,6 +102,9 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     GetParam(kCallSlot1 + i)->InitBool(("CallSlot" + std::to_string(i + 1)).c_str(), false);
     GetParam(kAssignSlot1 + i)->InitBool(("AssignSlot" + std::to_string(i + 1)).c_str(), false);
   }
+  // Oversampling / multicore
+  GetParam(kOversamplingFactor)->InitEnum("OversamplingFactor", 0, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"});
+  GetParam(kMulticoreEnabled)->InitBool("MulticoreEnabled", false);
 
   mSlotWorkerThread = std::thread([this]() { _SlotWorkerFunc(); });
 
@@ -338,6 +342,7 @@ NeuralAmpModeler::~NeuralAmpModeler()
   mSlotWorkerCV.notify_one();
   if (mSlotWorkerThread.joinable())
     mSlotWorkerThread.join();
+  _StopPhaseWorkers();
   _DeallocateIOPointers();
 }
 
@@ -377,7 +382,11 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
     triggerOutput = mNoiseGateTrigger.Process(mInputPointers, numChannelsInternal, numFrames);
   }
 
-  if (mModel != nullptr)
+  if (!mPhaseModels.empty())
+  {
+    _ProcessPolyphase(triggerOutput, mOutputPointers, nFrames);
+  }
+  else if (mModel != nullptr)
   {
     mModel->process(triggerOutput, mOutputPointers, nFrames);
   }
@@ -580,6 +589,24 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneMid: mToneStack->SetParam("middle", GetParam(paramIdx)->Value()); break;
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
+    case kOversamplingFactor:
+      // Request model reload with new dilation scaling (handled by slot worker thread)
+      if (mNAMPath.GetLength())
+      {
+        mSlotLoadRequest.store(-1); // -1 = reload current path
+        mSlotWorkerCV.notify_one();
+      }
+      break;
+    case kMulticoreEnabled:
+      // Start or stop worker threads based on new toggle state
+      if (!mPhaseModels.empty())
+      {
+        const int N = (int)mPhaseModels.size();
+        _StopPhaseWorkers();
+        if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
+          _StartPhaseWorkers(N - 1);
+      }
+      break;
     default:
       if (!mSlotParamGuard.load())
       {
@@ -678,6 +705,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mShouldRemoveModel)
   {
     mModel = nullptr;
+    _StopPhaseWorkers();
+    mPhaseModels.clear();
     mNAMPath.Set("");
     mShouldRemoveModel = false;
     mModelCleared = true;
@@ -694,8 +723,25 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
+    _StopPhaseWorkers();
+    mPhaseModels.clear();
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
+    mNewModelLoadedInDSP = true;
+    _UpdateLatency();
+    _SetInputGain();
+    _SetOutputGain();
+  }
+  if (!mStagedPhaseModels.empty())
+  {
+    mModel = nullptr;
+    _StopPhaseWorkers();
+    mPhaseModels = std::move(mStagedPhaseModels);
+    mStagedPhaseModels.clear();
+    // Start worker threads for phases 1..N-1
+    const int N = (int)mPhaseModels.size();
+    if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
+      _StartPhaseWorkers(N - 1);
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
@@ -745,6 +791,10 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
   {
     mModel->Reset(sampleRate, maxBlockSize);
   }
+  for (auto& pm : mStagedPhaseModels)
+    if (pm) pm->Reset(sampleRate, maxBlockSize);
+  for (auto& pm : mPhaseModels)
+    if (pm) pm->Reset(sampleRate, maxBlockSize);
 
   // IR
   if (mStagedIR != nullptr)
@@ -770,35 +820,39 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
 void NeuralAmpModeler::_SetInputGain()
 {
   iplug::sample inputGainDB = GetParam(kInputLevel)->Value();
-  // Input calibration
-  if ((mModel != nullptr) && (mModel->HasInputLevel()) && GetParam(kCalibrateInput)->Bool())
-  {
-    inputGainDB += GetParam(kInputCalibrationLevel)->Value() - mModel->GetInputLevel();
-  }
+  // Input calibration — use whichever model is active
+  const ResamplingNAM* activeModel = mModel.get();
+  if (!activeModel && !mPhaseModels.empty())
+    activeModel = mPhaseModels[0].get();
+  if (activeModel && activeModel->HasInputLevel() && GetParam(kCalibrateInput)->Bool())
+    inputGainDB += GetParam(kInputCalibrationLevel)->Value() - activeModel->GetInputLevel();
   mInputGain = DBToAmp(inputGainDB);
 }
 
 void NeuralAmpModeler::_SetOutputGain()
 {
   double gainDB = GetParam(kOutputLevel)->Value();
-  if (mModel != nullptr)
+  const ResamplingNAM* activeModel = mModel.get();
+  if (!activeModel && !mPhaseModels.empty())
+    activeModel = mPhaseModels[0].get();
+  if (activeModel != nullptr)
   {
     const int outputMode = GetParam(kOutputMode)->Int();
     switch (outputMode)
     {
       case 1: // Normalized
-        if (mModel->HasLoudness())
+        if (activeModel->HasLoudness())
         {
-          const double loudness = mModel->GetLoudness();
+          const double loudness = activeModel->GetLoudness();
           const double targetLoudness = -18.0;
           gainDB += (targetLoudness - loudness);
         }
         break;
       case 2: // Calibrated
-        if (mModel->HasOutputLevel())
+        if (activeModel->HasOutputLevel())
         {
           const double inputLevel = GetParam(kInputCalibrationLevel)->Value();
-          const double outputLevel = mModel->GetOutputLevel();
+          const double outputLevel = activeModel->GetOutputLevel();
           gainDB += (outputLevel - inputLevel);
         }
         break;
@@ -820,6 +874,10 @@ void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
   };
   apply(mModel.get());
   apply(mStagedModel.get());
+  for (auto& pm : mPhaseModels)
+    apply(pm.get());
+  for (auto& pm : mStagedPhaseModels)
+    apply(pm.get());
 }
 
 void NeuralAmpModeler::_SetSlotParamValue(int paramIdx, int value)
@@ -842,7 +900,7 @@ void NeuralAmpModeler::_SlotWorkerFunc()
     {
       std::unique_lock<std::mutex> lock(mSlotWorkerMutex);
       mSlotWorkerCV.wait(lock, [this]() {
-        return mSlotWorkerStop || mSlotLoadRequest.load() > 0 || mSlotAssignRequest.load() > 0;
+        return mSlotWorkerStop || mSlotLoadRequest.load() != 0 || mSlotAssignRequest.load() > 0;
       });
       if (mSlotWorkerStop)
         return;
@@ -882,7 +940,19 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 
   const int req = mSlotLoadRequest.exchange(0);
-  if (req <= 0)
+  if (req == 0)
+    return;
+  // -1 = reload current model with updated oversampling factor
+  if (req == -1)
+  {
+    if (mNAMPath.GetLength())
+    {
+      std::lock_guard<std::mutex> lock(mStageMutex);
+      _StageModel(mNAMPath);
+    }
+    return;
+  }
+  if (req < 0)
     return;
   const int active = mActiveSlot.load();
   if (req == active)
@@ -940,43 +1010,92 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 }
 
+// Scale all WaveNet dilation values in a .nam JSON by factor N.
+static nlohmann::json _ScaleDilationsInJson(const nlohmann::json& j, int factor)
+{
+  if (factor <= 1)
+    return j;
+  auto scaled = j;
+  if (scaled.value("architecture", "") == "WaveNet")
+  {
+    auto& layers = scaled["config"]["layers"];
+    for (auto& layer : layers)
+    {
+      auto& dilations = layer["dilations"];
+      for (auto& d : dilations)
+        d = d.get<int>() * factor;
+    }
+  }
+  return scaled;
+}
+
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
   WDL_String previousNAMPath = mNAMPath;
   try
   {
+    const int factorIdx = GetParam(kOversamplingFactor)->Int();
+    const int N = kOversamplingFactorValues[factorIdx];
+
     auto dspPath = std::filesystem::u8path(modelPath.Get());
-    std::unique_ptr<nam::DSP> model = nam::get_dsp(dspPath);
 
-    // Check that the model has 1 input and 1 output channel
-    if (model->NumInputChannels() != 1)
+    if (N <= 1)
     {
-      throw std::runtime_error("Model must have 1 input channel, but has " + std::to_string(model->NumInputChannels()));
+      // Existing single-model path
+      std::unique_ptr<nam::DSP> model = nam::get_dsp(dspPath);
+
+      if (model->NumInputChannels() != 1)
+        throw std::runtime_error("Model must have 1 input channel, but has "
+                                 + std::to_string(model->NumInputChannels()));
+      if (model->NumOutputChannels() != 1)
+        throw std::runtime_error("Model must have 1 output channel, but has "
+                                 + std::to_string(model->NumOutputChannels()));
+
+      std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+      temp->Reset(GetSampleRate(), GetBlockSize());
+      if (nam::SlimmableModel* slimmable = temp->GetSlimmableModel())
+        slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+
+      mStagedModel = std::move(temp);
+      mStagedPhaseModels.clear();
     }
-    if (model->NumOutputChannels() != 1)
+    else
     {
-      throw std::runtime_error("Model must have 1 output channel, but has "
-                               + std::to_string(model->NumOutputChannels()));
+      // Polyphase path: read JSON, scale dilations, create N instances
+      if (!std::filesystem::exists(dspPath))
+        throw std::runtime_error("Config file doesn't exist!\n");
+      std::ifstream f(dspPath);
+      nlohmann::json j;
+      f >> j;
+      const auto scaledJson = _ScaleDilationsInJson(j, N);
+
+      std::vector<std::unique_ptr<ResamplingNAM>> phases;
+      phases.reserve(N);
+      for (int p = 0; p < N; p++)
+      {
+        std::unique_ptr<nam::DSP> model = nam::get_dsp(scaledJson);
+        if (model->NumInputChannels() != 1)
+          throw std::runtime_error("Model must have 1 input channel");
+        if (model->NumOutputChannels() != 1)
+          throw std::runtime_error("Model must have 1 output channel");
+        auto wrapped = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+        wrapped->Reset(GetSampleRate(), GetBlockSize());
+        if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
+          slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+        phases.push_back(std::move(wrapped));
+      }
+      mStagedPhaseModels = std::move(phases);
+      mStagedModel = nullptr;
     }
 
-    std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
-    temp->Reset(GetSampleRate(), GetBlockSize());
-    if (nam::SlimmableModel* slimmable = temp->GetSlimmableModel())
-    {
-      slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
-    }
-    mStagedModel = std::move(temp);
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
   }
   catch (std::exception& e)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
-
-    if (mStagedModel != nullptr)
-    {
-      mStagedModel = nullptr;
-    }
+    mStagedModel = nullptr;
+    mStagedPhaseModels.clear();
     mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
@@ -986,6 +1105,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
     mStagedModel = nullptr;
+    mStagedPhaseModels.clear();
     mNAMPath = previousNAMPath;
     return "Unknown error loading DSP module";
   }
@@ -1136,34 +1256,36 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 
 void NeuralAmpModeler::_UpdateControlsFromModel()
 {
-  if (mModel == nullptr)
-  {
+  const ResamplingNAM* activeModel = mModel.get();
+  if (!activeModel && !mPhaseModels.empty())
+    activeModel = mPhaseModels[0].get();
+  if (activeModel == nullptr)
     return;
-  }
   if (auto* pGraphics = GetUI())
   {
     ModelInfo modelInfo;
     modelInfo.sampleRate.known = true;
-    modelInfo.sampleRate.value = mModel->GetEncapsulatedSampleRate();
-    modelInfo.inputCalibrationLevel.known = mModel->HasInputLevel();
-    modelInfo.inputCalibrationLevel.value = mModel->HasInputLevel() ? mModel->GetInputLevel() : 0.0;
-    modelInfo.outputCalibrationLevel.known = mModel->HasOutputLevel();
-    modelInfo.outputCalibrationLevel.value = mModel->HasOutputLevel() ? mModel->GetOutputLevel() : 0.0;
+    modelInfo.sampleRate.value = activeModel->GetEncapsulatedSampleRate();
+    modelInfo.inputCalibrationLevel.known = activeModel->HasInputLevel();
+    modelInfo.inputCalibrationLevel.value = activeModel->HasInputLevel() ? activeModel->GetInputLevel() : 0.0;
+    modelInfo.outputCalibrationLevel.known = activeModel->HasOutputLevel();
+    modelInfo.outputCalibrationLevel.value = activeModel->HasOutputLevel() ? activeModel->GetOutputLevel() : 0.0;
 
     static_cast<NAMSettingsPageControl*>(pGraphics->GetControlWithTag(kCtrlTagSettingsBox))->SetModelInfo(modelInfo);
 
-    const bool disableInputCalibrationControls = !mModel->HasInputLevel();
+    const bool disableInputCalibrationControls = !activeModel->HasInputLevel();
     pGraphics->GetControlWithTag(kCtrlTagCalibrateInput)->SetDisabled(disableInputCalibrationControls);
     pGraphics->GetControlWithTag(kCtrlTagInputCalibrationLevel)->SetDisabled(disableInputCalibrationControls);
     {
       auto* c = static_cast<OutputModeControl*>(pGraphics->GetControlWithTag(kCtrlTagOutputMode));
-      c->SetNormalizedDisable(!mModel->HasLoudness());
-      c->SetCalibratedDisable(!mModel->HasOutputLevel());
+      c->SetNormalizedDisable(!activeModel->HasLoudness());
+      c->SetCalibratedDisable(!activeModel->HasOutputLevel());
     }
 
+    // Slimmable icon: only relevant for single-model mode
     if (auto* pSlimIcon = pGraphics->GetControlWithTag(kCtrlTagSlimmableIcon))
     {
-      const bool show = mModel->GetSlimmableModel() != nullptr;
+      const bool show = mModel != nullptr && mModel->GetSlimmableModel() != nullptr;
       pSlimIcon->Hide(!show);
     }
   }
@@ -1173,9 +1295,9 @@ void NeuralAmpModeler::_UpdateLatency()
 {
   int latency = 0;
   if (mModel)
-  {
     latency += mModel->GetLatency();
-  }
+  else if (!mPhaseModels.empty())
+    latency += mPhaseModels[0]->GetLatency();
   // Other things that add latency here...
 
   // Feels weird to have to do this.
@@ -1192,6 +1314,137 @@ void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPoint
   const int nChansHack = 1;
   mInputSender.ProcessBlock(inputPointer, (int)nFrames, kCtrlTagInputMeter, nChansHack);
   mOutputSender.ProcessBlock(outputPointer, (int)nFrames, kCtrlTagOutputMeter, nChansHack);
+}
+
+void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
+{
+  if ((int)mPhaseInputBufs.size() != N)
+  {
+    mPhaseInputBufs.resize(N);
+    mPhaseOutputBufs.resize(N);
+    mPhaseInputPtrs.resize(N);
+    mPhaseOutputPtrs.resize(N);
+  }
+  for (int p = 0; p < N; p++)
+  {
+    if ((int)mPhaseInputBufs[p].size() < framesPerPhase)
+      mPhaseInputBufs[p].resize(framesPerPhase, 0.0);
+    if ((int)mPhaseOutputBufs[p].size() < framesPerPhase)
+      mPhaseOutputBufs[p].resize(framesPerPhase, 0.0);
+    mPhaseInputPtrs[p] = mPhaseInputBufs[p].data();
+    mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
+  }
+}
+
+void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
+{
+  const int N = (int)mPhaseModels.size();
+  const int phaseFrames = nFrames / N;
+  const int remainder = nFrames % N;
+
+  _EnsurePhaseBuffers(N, phaseFrames + 1);
+
+  // Demux: scatter input into per-phase buffers (stride N)
+  for (int p = 0; p < N; p++)
+    for (int i = 0; i < phaseFrames; i++)
+      mPhaseInputBufs[p][i] = input[0][p + i * N];
+
+  const bool multicore = GetParam(kMulticoreEnabled)->Bool();
+
+  if (multicore && (int)mPhaseWorkers.size() == N - 1)
+  {
+    // Dispatch phases 1..N-1 to worker threads
+    for (int p = 1; p < N; p++)
+    {
+      auto& w = *mPhaseWorkers[p - 1];
+      w.input = &mPhaseInputPtrs[p];
+      w.output = &mPhaseOutputPtrs[p];
+      w.numFrames = phaseFrames;
+      w.model = mPhaseModels[p].get();
+      {
+        std::lock_guard<std::mutex> lk(w.doneMtx);
+        w.done = false;
+      }
+      {
+        std::lock_guard<std::mutex> lk(w.workMtx);
+        w.workReady = true;
+      }
+      w.workCV.notify_one();
+    }
+    // Audio thread processes phase 0
+    mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], phaseFrames);
+    // Wait for all workers
+    for (auto& w : mPhaseWorkers)
+    {
+      std::unique_lock<std::mutex> lk(w->doneMtx);
+      w->doneCV.wait(lk, [&w] { return w->done; });
+    }
+  }
+  else
+  {
+    // Serial processing
+    for (int p = 0; p < N; p++)
+      mPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], phaseFrames);
+  }
+
+  // Mux: gather outputs back into interleaved order
+  for (int p = 0; p < N; p++)
+    for (int i = 0; i < phaseFrames; i++)
+      output[0][p + i * N] = mPhaseOutputBufs[p][i];
+
+  // Remainder frames: process serially with phase 0 model
+  if (remainder > 0)
+  {
+    const int startIdx = phaseFrames * N;
+    for (int j = 0; j < remainder; j++)
+      mPhaseInputBufs[0][j] = input[0][startIdx + j];
+    mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], remainder);
+    for (int j = 0; j < remainder; j++)
+      output[0][startIdx + j] = mPhaseOutputBufs[0][j];
+  }
+}
+
+void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
+{
+  for (int i = 0; i < numWorkers; i++)
+  {
+    auto w = std::make_unique<PhaseWorker>();
+    w->phaseIdx = i + 1;
+    w->thread = std::thread([wp = w.get(), this]() {
+      while (true)
+      {
+        {
+          std::unique_lock<std::mutex> lk(wp->workMtx);
+          wp->workCV.wait(lk, [wp] { return wp->workReady || wp->quit; });
+          if (wp->quit)
+            break;
+          wp->workReady = false;
+        }
+        wp->model->process(wp->input, wp->output, wp->numFrames);
+        {
+          std::lock_guard<std::mutex> lk(wp->doneMtx);
+          wp->done = true;
+        }
+        wp->doneCV.notify_one();
+      }
+    });
+    mPhaseWorkers.push_back(std::move(w));
+  }
+}
+
+void NeuralAmpModeler::_StopPhaseWorkers()
+{
+  for (auto& w : mPhaseWorkers)
+  {
+    {
+      std::lock_guard<std::mutex> lk(w->workMtx);
+      w->quit = true;
+    }
+    w->workCV.notify_one();
+    if (w->thread.joinable())
+      w->thread.join();
+  }
+  mPhaseWorkers.clear();
 }
 
 // HACK
