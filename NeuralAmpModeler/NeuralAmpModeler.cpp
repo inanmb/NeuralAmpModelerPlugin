@@ -767,6 +767,11 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
     mStagedPhaseModels.clear();
+    // Reset Lanczos filter state — new model, new N, start clean
+    mLanczosHistory.clear();
+    mLanczosCoeffs.clear();
+    mOutputDelayRing.clear();
+    mOutputDelayPos = 0;
     // Start worker threads for phases 1..N-1
     const int N = (int)mPhaseModels.size();
     if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
@@ -1321,13 +1326,14 @@ void NeuralAmpModeler::_UpdateLatency()
   if (mModel)
     latency += mModel->GetLatency();
   else if (!mPhaseModels.empty())
-    latency += mPhaseModels[0]->GetLatency();
-
-  // Feels weird to have to do this.
-  if (GetLatency() != latency)
   {
-    SetLatency(latency);
+    latency += mPhaseModels[0]->GetLatency();
+    // Lanczos polyphase filter: upsampling (kPolyphaseA-1) + output delay ring (kPolyphaseA)
+    latency += (kPolyphaseA - 1) + kPolyphaseA;
   }
+
+  if (GetLatency() != latency)
+    SetLatency(latency);
 }
 
 void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPointer, const size_t nFrames,
@@ -1359,34 +1365,86 @@ void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
   }
 }
 
+static double _LanczosKernel(double x, int A)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  if (std::fabs(x) < 1e-7) return 1.0;
+  if (std::fabs(x) >= A) return 0.0;
+  return A * std::sin(kPi * x) * std::sin(kPi * x / A) / (kPi * kPi * x * x);
+}
+
+void NeuralAmpModeler::_PrecomputeLanczosCoeffs(int N)
+{
+  mLanczosCoeffs.resize(N);
+  for (int p = 0; p < N; p++)
+  {
+    mLanczosCoeffs[p].resize(2 * kPolyphaseA);
+    const double frac = (double)p / N;
+    double sum = 0.0;
+    for (int k = 0; k < 2 * kPolyphaseA; k++)
+    {
+      // Causal kernel: center at k = kPolyphaseA-1, shifted by frac toward the future.
+      const double x = (kPolyphaseA - 1 - k) + frac;
+      mLanczosCoeffs[p][k] = _LanczosKernel(x, kPolyphaseA);
+      sum += mLanczosCoeffs[p][k];
+    }
+    // Normalize to unity DC gain
+    for (auto& c : mLanczosCoeffs[p]) c /= sum;
+  }
+}
+
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = (int)mPhaseModels.size();
-
-  // Each model processes ALL nFrames (not nFrames/N): CPU scales ×N.
   _EnsurePhaseBuffers(N, nFrames);
 
-  // Phase p receives the input signal fractionally delayed by p/N samples.
-  // This is equivalent to polyphase decomposition of an N×-upsampled signal:
-  // nonlinear harmonics above Fs/(2N) cancel in the output average → aliasing reduction.
+  const int histSize = 2 * kPolyphaseA;
+
+  // Initialize Lanczos state on first use or after model reload
+  if ((int)mLanczosHistory.size() != histSize)
+    mLanczosHistory.assign(histSize, 0.0);
+  if ((int)mLanczosCoeffs.size() != N)
+    _PrecomputeLanczosCoeffs(N);
+  if ((int)mOutputDelayRing.size() != kPolyphaseA)
+  {
+    mOutputDelayRing.assign(kPolyphaseA, 0.0);
+    mOutputDelayPos = 0;
+  }
+
+  // Upsampling: Lanczos fractional-delay for each phase.
+  // Phase p receives input delayed by (kPolyphaseA-1 - p/N) samples (causal, A-1 group delay).
+  // Anti-imaging: stopband attenuation improves with A; A=52 ≈ reference performance.
   for (int p = 0; p < N; p++)
   {
-    const double frac = p / (double)N;
-    const double ifrac = 1.0 - frac;
+    const double* coeff = mLanczosCoeffs[p].data();
     for (int i = 0; i < nFrames; i++)
     {
-      const double x0 = input[0][i];
-      // Use x0 for last frame (imperceptible error; avoids lookahead into next block).
-      const double x1 = (i + 1 < nFrames) ? input[0][i + 1] : x0;
-      mPhaseInputBufs[p][i] = x0 * ifrac + x1 * frac;
+      double y = 0.0;
+      for (int k = 0; k < histSize; k++)
+      {
+        const int srcIdx = i - k;
+        const double xval = (srcIdx < 0) ? mLanczosHistory[histSize + srcIdx] : input[0][srcIdx];
+        y += coeff[k] * xval;
+      }
+      mPhaseInputBufs[p][i] = y;
     }
   }
 
-  const bool multicore = GetParam(kMulticoreEnabled)->Bool();
+  // Update input history: keep last histSize samples for next block
+  if (nFrames >= histSize)
+  {
+    std::copy(input[0] + nFrames - histSize, input[0] + nFrames, mLanczosHistory.begin());
+  }
+  else
+  {
+    std::copy(mLanczosHistory.begin() + nFrames, mLanczosHistory.end(), mLanczosHistory.begin());
+    std::copy(input[0], input[0] + nFrames, mLanczosHistory.begin() + histSize - nFrames);
+  }
 
+  // Model processing (multicore or serial)
+  const bool multicore = GetParam(kMulticoreEnabled)->Bool();
   if (multicore && (int)mPhaseWorkers.size() == N - 1)
   {
-    // Dispatch phases 1..N-1 to worker threads
     for (int p = 1; p < N; p++)
     {
       auto& w = *mPhaseWorkers[p - 1];
@@ -1394,19 +1452,11 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
       w.output = &mPhaseOutputPtrs[p];
       w.numFrames = nFrames;
       w.model = mPhaseModels[p].get();
-      {
-        std::lock_guard<std::mutex> lk(w.doneMtx);
-        w.done = false;
-      }
-      {
-        std::lock_guard<std::mutex> lk(w.workMtx);
-        w.workReady = true;
-      }
+      {std::lock_guard<std::mutex> lk(w.doneMtx); w.done = false;}
+      {std::lock_guard<std::mutex> lk(w.workMtx); w.workReady = true;}
       w.workCV.notify_one();
     }
-    // Audio thread processes phase 0
     mPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
-    // Wait for all workers
     for (auto& w : mPhaseWorkers)
     {
       std::unique_lock<std::mutex> lk(w->doneMtx);
@@ -1419,14 +1469,20 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
       mPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
   }
 
-  // Output = average of all N phase outputs.
-  // Equivalent to anti-aliased decimation of the N×Fs interleaved signal back to Fs.
+  // Downsampling: average phase outputs (adequate anti-aliasing for audio models),
+  // then pass through kPolyphaseA-sample ring-buffer delay for symmetric total latency.
+  // Total latency ≈ (kPolyphaseA-1) [upsampling] + kPolyphaseA [ring] = 2*kPolyphaseA-1 = 103 samples.
   for (int i = 0; i < nFrames; i++)
   {
     double sum = 0.0;
-    for (int p = 0; p < N; p++)
-      sum += mPhaseOutputBufs[p][i];
-    output[0][i] = sum / N;
+    for (int p = 0; p < N; p++) sum += mPhaseOutputBufs[p][i];
+    const double avg = sum / N;
+
+    // Ring buffer: output is kPolyphaseA samples old
+    const double delayed = mOutputDelayRing[mOutputDelayPos];
+    mOutputDelayRing[mOutputDelayPos] = avg;
+    mOutputDelayPos = (mOutputDelayPos + 1) % kPolyphaseA;
+    output[0][i] = delayed;
   }
 }
 

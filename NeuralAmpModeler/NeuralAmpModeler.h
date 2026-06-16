@@ -422,6 +422,15 @@ private:
   std::vector<iplug::sample*> mPhaseInputPtrs;
   std::vector<iplug::sample*> mPhaseOutputPtrs;
 
+  // Lanczos polyphase filter (anti-imaging upsampling + symmetric output delay)
+  // A=52 → group delay ≈ 52 samples (upsampling) + 52 samples (output ring) ≈ 104 samples total
+  static constexpr int kPolyphaseA = 52;
+  std::vector<double> mLanczosHistory;            // 2*kPolyphaseA past input samples
+  std::vector<std::vector<double>> mLanczosCoeffs; // [N][2*kPolyphaseA] per-phase filter taps
+  std::vector<double> mOutputDelayRing;            // kPolyphaseA-sample ring buffer for output delay
+  int mOutputDelayPos = 0;
+  void _PrecomputeLanczosCoeffs(int N);
+
   struct PhaseWorker
   {
     std::thread thread;
