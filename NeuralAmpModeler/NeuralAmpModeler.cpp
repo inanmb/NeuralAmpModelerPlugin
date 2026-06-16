@@ -1012,8 +1012,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
 }
 
 // Scale all WaveNet dilation values in a .nam JSON by factor N (Gateway OS approach).
-// Combined with per-sample polyphase interleaving, this maintains the correct temporal
-// receptive field: each thread sees every N-th sample, scaled dilations compensate.
+// Scales WaveNet dilation values by factor to extend the model's temporal receptive field.
 static nlohmann::json _ScaleDilationsInJson(const nlohmann::json& j, int factor)
 {
   if (factor <= 1)
@@ -1056,21 +1055,15 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
     if (N > 1)
     {
-      // Polyphase path: N models each with dilations×N.
-      // Thread p processes samples p, p+N, p+2N... Dilation scaling maintains temporal receptive field.
-      // Multicore toggle determines threading; DSP result is identical either way.
+      // Dilation scaling path: one model with dilations×N, extends temporal receptive field.
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
       std::ifstream f(dspPath);
       nlohmann::json j;
       f >> j;
       const auto scaledJson = _ScaleDilationsInJson(j, N);
-      std::vector<std::unique_ptr<ResamplingNAM>> phases;
-      phases.reserve(N);
-      for (int p = 0; p < N; p++)
-        phases.push_back(wrapModel(nam::get_dsp(scaledJson)));
-      mStagedPhaseModels = std::move(phases);
-      mStagedModel = nullptr;
+      mStagedModel = wrapModel(nam::get_dsp(scaledJson));
+      mStagedPhaseModels.clear();
     }
     else
     {
