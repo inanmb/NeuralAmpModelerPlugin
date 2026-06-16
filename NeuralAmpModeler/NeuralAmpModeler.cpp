@@ -26,11 +26,19 @@ using namespace igraphics;
 
 const double kDCBlockerFrequency = 5.0;
 
-// Temporary debug logging — writes to C:\NAM_debug.log
+// Temporary debug logging
 static void _NAMLog(const char* fmt, ...)
 {
-  FILE* f = fopen("C:\\NAM_debug.log", "a");
-  if (!f) f = fopen("/tmp/NAM_debug.log", "a");
+  // Try multiple locations in order
+  const char* paths[] = {
+    "C:\\temp\\NAM_debug.log",
+    "C:\\Users\\Public\\NAM_debug.log",
+    "C:\\NAM_debug.log",
+    nullptr
+  };
+  FILE* f = nullptr;
+  for (int i = 0; paths[i] && !f; i++)
+    f = fopen(paths[i], "a");
   if (!f) return;
   va_list args;
   va_start(args, fmt);
@@ -96,6 +104,7 @@ const double kDefaultInputCalibrationLevel = 12.0;
 NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 : Plugin(info, MakeConfig(kNumParams, kNumPresets))
 {
+  NAM_LOG("[NAM] Plugin constructor called — logging works\n");
   _InitToneStack();
   nam::activations::Activation::enable_fast_tanh();
   GetParam(kInputLevel)->InitGain("Input", 0.0, -20.0, 20.0, 0.1);
