@@ -599,8 +599,12 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
       }
       break;
     case kMulticoreEnabled:
-      // Signal _ApplyDSPStaging to sync workers on the next ProcessBlock.
-      mMulticoreTogglePending.store(true);
+      // Changing multicore changes whether we use 1 or N model instances → reload.
+      if (!mSlotParamGuard.load() && mNAMPath.GetLength())
+      {
+        mSlotLoadRequest.store(-1);
+        mSlotWorkerCV.notify_one();
+      }
       break;
     default:
       if (!mSlotParamGuard.load())
@@ -746,14 +750,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   {
     mIR = std::move(mStagedIR);
     mStagedIR = nullptr;
-  }
-  // Sync worker threads if multicore toggle changed
-  if (mMulticoreTogglePending.exchange(false) && !mPhaseModels.empty())
-  {
-    const int N = (int)mPhaseModels.size();
-    _StopPhaseWorkers();
-    if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
-      _StartPhaseWorkers(N - 1);
   }
 }
 
@@ -1039,54 +1035,58 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     const int factorIdx = GetParam(kOversamplingFactor)->Int();
     const int N = kOversamplingFactorValues[factorIdx];
+    const bool multicore = GetParam(kMulticoreEnabled)->Bool();
 
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
-    if (N <= 1)
-    {
-      // Existing single-model path
-      std::unique_ptr<nam::DSP> model = nam::get_dsp(dspPath);
+    // Helper: load JSON with optional dilation scaling
+    auto loadScaledJson = [&]() -> nlohmann::json {
+      if (!std::filesystem::exists(dspPath))
+        throw std::runtime_error("Config file doesn't exist!\n");
+      std::ifstream f(dspPath);
+      nlohmann::json j;
+      f >> j;
+      return _ScaleDilationsInJson(j, N);
+    };
 
+    // Helper: validate and wrap a nam::DSP into ResamplingNAM
+    auto wrapModel = [&](std::unique_ptr<nam::DSP> model) -> std::unique_ptr<ResamplingNAM> {
       if (model->NumInputChannels() != 1)
         throw std::runtime_error("Model must have 1 input channel, but has "
                                  + std::to_string(model->NumInputChannels()));
       if (model->NumOutputChannels() != 1)
         throw std::runtime_error("Model must have 1 output channel, but has "
                                  + std::to_string(model->NumOutputChannels()));
-
-      std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
-      temp->Reset(GetSampleRate(), GetBlockSize());
-      if (nam::SlimmableModel* slimmable = temp->GetSlimmableModel())
+      auto wrapped = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+      wrapped->Reset(GetSampleRate(), GetBlockSize());
+      if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
         slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+      return wrapped;
+    };
 
-      mStagedModel = std::move(temp);
+    if (N <= 1 || !multicore)
+    {
+      // Single-model path:
+      // N=1  → normal load, no scaling
+      // N>1 but multicore off → one model with dilations×N (larger receptive field)
+      std::unique_ptr<nam::DSP> model;
+      if (N <= 1)
+        model = nam::get_dsp(dspPath);
+      else
+        model = nam::get_dsp(loadScaledJson());
+
+      mStagedModel = wrapModel(std::move(model));
       mStagedPhaseModels.clear();
     }
     else
     {
-      // Polyphase path: read JSON, scale dilations, create N instances
-      if (!std::filesystem::exists(dspPath))
-        throw std::runtime_error("Config file doesn't exist!\n");
-      std::ifstream f(dspPath);
-      nlohmann::json j;
-      f >> j;
-      const auto scaledJson = _ScaleDilationsInJson(j, N);
-
+      // Polyphase path (oversampling + multicore both on):
+      // N models with dilations×N, each processes its interleaved phase
+      const auto scaledJson = loadScaledJson();
       std::vector<std::unique_ptr<ResamplingNAM>> phases;
       phases.reserve(N);
       for (int p = 0; p < N; p++)
-      {
-        std::unique_ptr<nam::DSP> model = nam::get_dsp(scaledJson);
-        if (model->NumInputChannels() != 1)
-          throw std::runtime_error("Model must have 1 input channel");
-        if (model->NumOutputChannels() != 1)
-          throw std::runtime_error("Model must have 1 output channel");
-        auto wrapped = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
-        wrapped->Reset(GetSampleRate(), GetBlockSize());
-        if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
-          slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
-        phases.push_back(std::move(wrapped));
-      }
+        phases.push_back(wrapModel(nam::get_dsp(scaledJson)));
       mStagedPhaseModels = std::move(phases);
       mStagedModel = nullptr;
     }
@@ -1285,10 +1285,9 @@ void NeuralAmpModeler::_UpdateControlsFromModel()
       c->SetCalibratedDisable(!activeModel->HasOutputLevel());
     }
 
-    // Slimmable icon: only relevant for single-model mode
     if (auto* pSlimIcon = pGraphics->GetControlWithTag(kCtrlTagSlimmableIcon))
     {
-      const bool show = mModel != nullptr && mModel->GetSlimmableModel() != nullptr;
+      const bool show = activeModel->GetSlimmableModel() != nullptr;
       pSlimIcon->Hide(!show);
     }
   }
