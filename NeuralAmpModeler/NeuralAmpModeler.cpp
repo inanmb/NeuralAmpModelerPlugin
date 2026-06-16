@@ -1044,7 +1044,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 }
 
-// Scale all WaveNet dilation values in a .nam JSON by factor N (Gateway OS approach).
+// Scale all WaveNet dilation values in a .nam JSON by factor N.
 // Scales WaveNet dilation values by factor to extend the model's temporal receptive field.
 static nlohmann::json _ScaleDilationsInJson(const nlohmann::json& j, int factor)
 {
