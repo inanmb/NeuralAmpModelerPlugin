@@ -590,22 +590,17 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
     case kOversamplingFactor:
-      // Request model reload with new dilation scaling (handled by slot worker thread)
-      if (mNAMPath.GetLength())
+      // Reload the model with new dilation scaling.
+      // Guard check avoids spurious reload during preset recall / unserialization.
+      if (!mSlotParamGuard.load() && mNAMPath.GetLength())
       {
-        mSlotLoadRequest.store(-1); // -1 = reload current path
+        mSlotLoadRequest.store(-1);
         mSlotWorkerCV.notify_one();
       }
       break;
     case kMulticoreEnabled:
-      // Start or stop worker threads based on new toggle state
-      if (!mPhaseModels.empty())
-      {
-        const int N = (int)mPhaseModels.size();
-        _StopPhaseWorkers();
-        if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
-          _StartPhaseWorkers(N - 1);
-      }
+      // Signal _ApplyDSPStaging to sync workers on the next ProcessBlock.
+      mMulticoreTogglePending.store(true);
       break;
     default:
       if (!mSlotParamGuard.load())
@@ -751,6 +746,14 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   {
     mIR = std::move(mStagedIR);
     mStagedIR = nullptr;
+  }
+  // Sync worker threads if multicore toggle changed
+  if (mMulticoreTogglePending.exchange(false) && !mPhaseModels.empty())
+  {
+    const int N = (int)mPhaseModels.size();
+    _StopPhaseWorkers();
+    if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
+      _StartPhaseWorkers(N - 1);
   }
 }
 
