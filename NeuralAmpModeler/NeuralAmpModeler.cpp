@@ -736,15 +736,16 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
 
-    // Set up (or tear down) the oversampling container
+    // Set up (or tear down) the oversampling container.
+    // The outer ResamplingContainer upsamples by N, so the model receives up to N*hostBlockSize frames.
     const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-    const bool multicore = GetParam(kMulticoreEnabled)->Bool();
-    if (N > 1 && !multicore)
+    if (N > 1)
     {
       const double hostRate = GetSampleRate();
-      mModel->Reset(hostRate * N, GetBlockSize());
+      const int hostBlockSize = GetBlockSize();
+      mModel->Reset(hostRate * N, hostBlockSize * N);
       mOversamplingContainer = std::make_unique<dsp::ResamplingContainer<NAM_SAMPLE, 1, 12>>(hostRate * N);
-      mOversamplingContainer->Reset(hostRate, GetBlockSize());
+      mOversamplingContainer->Reset(hostRate, hostBlockSize);
     }
     else
     {
@@ -817,7 +818,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (mOversamplingContainer)
     {
       const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-      mModel->Reset(sampleRate * N, maxBlockSize);
+      mModel->Reset(sampleRate * N, maxBlockSize * N);
       mOversamplingContainer->Reset(sampleRate, maxBlockSize);
     }
     else
@@ -1051,8 +1052,6 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   try
   {
     const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-    const bool multicore = GetParam(kMulticoreEnabled)->Bool();
-
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
     // Helper: validate and wrap a nam::DSP into ResamplingNAM at host sample rate.
@@ -1071,22 +1070,9 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       return wrapped;
     };
 
-    if (multicore && N > 1)
-    {
-      // Polyphase multicore path: N identical model instances (no dilation scaling).
-      std::vector<std::unique_ptr<ResamplingNAM>> phases;
-      phases.reserve(N);
-      for (int p = 0; p < N; p++)
-        phases.push_back(wrapModel(nam::get_dsp(dspPath)));
-      mStagedPhaseModels = std::move(phases);
-      mStagedModel = nullptr;
-    }
-    else
-    {
-      // Single-model path. Oversampling container (if N>1) is set up in _ApplyDSPStaging.
-      mStagedModel = wrapModel(nam::get_dsp(dspPath));
-      mStagedPhaseModels.clear();
-    }
+    // Always single-model path. Oversampling container (if N>1) is set up in _ApplyDSPStaging.
+    mStagedModel = wrapModel(nam::get_dsp(dspPath));
+    mStagedPhaseModels.clear();
 
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
