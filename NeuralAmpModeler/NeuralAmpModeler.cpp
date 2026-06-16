@@ -1055,34 +1055,15 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
     if (N > 1)
     {
-      // Polyphase path: N models each with dilations×N.
-      // Phase models bypass ResamplingNAM's rate conversion (modelRate == expectedRate)
-      // to avoid double-resampling on top of polyphase interleaving.
-      auto wrapPhaseModel = [&](std::unique_ptr<nam::DSP> model) -> std::unique_ptr<ResamplingNAM> {
-        if (model->NumInputChannels() != 1)
-          throw std::runtime_error("Model must have 1 input channel");
-        if (model->NumOutputChannels() != 1)
-          throw std::runtime_error("Model must have 1 output channel");
-        const double modelRate = GetNAMSampleRate(model);
-        auto wrapped = std::make_unique<ResamplingNAM>(std::move(model), modelRate);
-        wrapped->Reset(modelRate, GetBlockSize());
-        if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
-          slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
-        return wrapped;
-      };
-
+      // Single model with dilations×N: extends temporal receptive field transparently.
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
       std::ifstream f(dspPath);
       nlohmann::json j;
       f >> j;
       const auto scaledJson = _ScaleDilationsInJson(j, N);
-      std::vector<std::unique_ptr<ResamplingNAM>> phases;
-      phases.reserve(N);
-      for (int p = 0; p < N; p++)
-        phases.push_back(wrapPhaseModel(nam::get_dsp(scaledJson)));
-      mStagedPhaseModels = std::move(phases);
-      mStagedModel = nullptr;
+      mStagedModel = wrapModel(nam::get_dsp(scaledJson));
+      mStagedPhaseModels.clear();
     }
     else
     {
