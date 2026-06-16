@@ -362,6 +362,9 @@ private:
 
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;
+  // Pending latency value to apply on the UI thread (VST3 requires SetLatency from UI thread).
+  // -1 means no pending update.
+  std::atomic<int> mPendingLatency{-1};
 
   // Tone stack modules
   std::unique_ptr<dsp::tone_stack::AbstractToneStack> mToneStack;

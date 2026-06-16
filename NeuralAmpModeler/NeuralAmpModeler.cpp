@@ -476,6 +476,13 @@ void NeuralAmpModeler::OnIdle()
   mInputSender.TransmitData(*this);
   mOutputSender.TransmitData(*this);
 
+  // Apply pending latency change on the UI thread so the VST3 host picks it up.
+  {
+    const int pending = mPendingLatency.exchange(-1, std::memory_order_relaxed);
+    if (pending >= 0)
+      SetLatency(pending);
+  }
+
   if (mNewModelLoadedInDSP)
   {
     if (auto* pGraphics = GetUI())
@@ -1332,8 +1339,10 @@ void NeuralAmpModeler::_UpdateLatency()
     latency += (kPolyphaseA - 1) + kPolyphaseA;
   }
 
+  // VST3 requires SetLatency to be called from the UI thread.
+  // Store the pending value here (audio thread); OnIdle applies it on the UI thread.
   if (GetLatency() != latency)
-    SetLatency(latency);
+    mPendingLatency.store(latency, std::memory_order_relaxed);
 }
 
 void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPointer, const size_t nFrames,
