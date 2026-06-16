@@ -821,7 +821,7 @@ void NeuralAmpModeler::_SetInputGain()
 {
   iplug::sample inputGainDB = GetParam(kInputLevel)->Value();
   // Input calibration — use whichever model is active
-  const ResamplingNAM* activeModel = mModel.get();
+  ResamplingNAM* activeModel = mModel.get();
   if (!activeModel && !mPhaseModels.empty())
     activeModel = mPhaseModels[0].get();
   if (activeModel && activeModel->HasInputLevel() && GetParam(kCalibrateInput)->Bool())
@@ -832,7 +832,7 @@ void NeuralAmpModeler::_SetInputGain()
 void NeuralAmpModeler::_SetOutputGain()
 {
   double gainDB = GetParam(kOutputLevel)->Value();
-  const ResamplingNAM* activeModel = mModel.get();
+  ResamplingNAM* activeModel = mModel.get();
   if (!activeModel && !mPhaseModels.empty())
     activeModel = mPhaseModels[0].get();
   if (activeModel != nullptr)
@@ -1256,7 +1256,7 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 
 void NeuralAmpModeler::_UpdateControlsFromModel()
 {
-  const ResamplingNAM* activeModel = mModel.get();
+  ResamplingNAM* activeModel = mModel.get();
   if (!activeModel && !mPhaseModels.empty())
     activeModel = mPhaseModels[0].get();
   if (activeModel == nullptr)

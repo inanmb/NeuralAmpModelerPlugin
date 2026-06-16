@@ -817,7 +817,7 @@ public:
       const float btnSize = 8.0f;
       AddNamedChildControl(
         new IVRadioButtonControl(osRadioArea, kOversamplingFactor, {"Off", "2x", "3x", "4x", "8x", "16x", "32x"},
-                                 "OversamplingFactor", mRadioButtonStyle, EDirection::Horizontal, btnSize),
+                                 "OversamplingFactor", mRadioButtonStyle, EVShape::Ellipse, EDirection::Horizontal, btnSize),
         mControlNames.osRadio, kCtrlTagOversamplingControl);
 
       // Multicore toggle
