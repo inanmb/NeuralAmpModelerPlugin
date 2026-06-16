@@ -425,25 +425,26 @@ private:
   // Set to true (release) only after staged vectors are fully populated.
   // Audio thread checks this (acquire) before consuming them.
   std::atomic<bool> mPhaseModelsReady{false};
-  // Per-phase scratch buffers (single channel)
-  std::vector<std::vector<iplug::sample>> mPhaseInputBufs;
-  std::vector<std::vector<iplug::sample>> mPhaseOutputBufs;
-  std::vector<iplug::sample*> mPhaseInputPtrs;
-  std::vector<iplug::sample*> mPhaseOutputPtrs;
+  // Per-phase scratch buffers (single channel, NAM_SAMPLE for direct model I/O)
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseInputBufs;
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutputBufs;
+  std::vector<NAM_SAMPLE*> mPhaseInputPtrs;
+  std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
 
   // Shared Lanczos upsampler (Fs → N×Fs). Initialized when N>1, null otherwise.
   // Group delay ≈ A = kPolyphaseA samples at Fs.
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
-  std::vector<double> mPolyUpBuf; // N×nFrames upsampled buffer
+  std::vector<double> mPolyUpBuf;    // N×nFrames upsampled buffer (double, LanczosResampler)
+  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // float scratch for mModel (N=1) boundary
 
   struct PhaseWorker
   {
     std::thread thread;
     int phaseIdx = 0;
     // Work assignment
-    iplug::sample** input = nullptr;
-    iplug::sample** output = nullptr;
+    NAM_SAMPLE** input = nullptr;
+    NAM_SAMPLE** output = nullptr;
     int numFrames = 0;
     nam::DSP* model = nullptr;
     // Wake worker

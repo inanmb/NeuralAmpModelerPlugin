@@ -413,7 +413,11 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   }
   else if (mModel != nullptr)
   {
-    mModel->process(triggerOutput, mOutputPointers, nFrames);
+    if ((int)mModelInF.size() < nFrames) { mModelInF.resize(nFrames); mModelOutF.resize(nFrames); }
+    for (int i = 0; i < nFrames; i++) mModelInF[i] = static_cast<NAM_SAMPLE>(triggerOutput[0][i]);
+    NAM_SAMPLE* inF = mModelInF.data(); NAM_SAMPLE* outF = mModelOutF.data();
+    mModel->process(&inF, &outF, nFrames);
+    for (int i = 0; i < nFrames; i++) mOutputPointers[0][i] = static_cast<iplug::sample>(mModelOutF[i]);
   }
   else
   {
