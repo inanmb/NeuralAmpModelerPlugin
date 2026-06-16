@@ -22,6 +22,13 @@
       <AdditionalIncludeDirectories>$(SolutionDir)dsp;$(IPLUG2_ROOT)\..\eigen;$(EXTRA_INC_PATHS);$(IPLUG_INC_PATHS);$(IGRAPHICS_INC_PATHS);$(GLAD_GL2_PATHS);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>$(EXTRA_ALL_DEFS);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <OpenMPSupport>true</OpenMPSupport>
+      <!-- AVX2 + FMA: lets Eigen use 256-bit FMA in its GEMM kernels.
+           /fp:fast: enables FMA fusion and relaxes strict IEEE ordering.
+           These two together are the only compiler flags that meaningfully
+           affect the WaveNet inner loop; intrinsics in plugin code would
+           target buffers that represent <0.5% of total compute. -->
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <AdditionalOptions>/fp:fast %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <AdditionalDependencies>wininet.lib;comctl32.lib;Shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
