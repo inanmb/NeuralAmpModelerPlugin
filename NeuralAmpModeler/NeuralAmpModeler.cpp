@@ -712,6 +712,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mShouldRemoveModel)
   {
     mModel = nullptr;
+    mOversamplingContainer.reset();
     _StopPhaseWorkers();
     mPhaseModels.clear();
     mNAMPath.Set("");
@@ -758,6 +759,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (!mStagedPhaseModels.empty())
   {
     mModel = nullptr;
+    mOversamplingContainer.reset(); // polyphase path has no outer oversampling container
     _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
     mStagedPhaseModels.clear();
