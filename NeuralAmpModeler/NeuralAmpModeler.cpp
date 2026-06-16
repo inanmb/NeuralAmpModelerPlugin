@@ -1055,15 +1055,14 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
     if (N > 1)
     {
-      // Single model with dilations×N: extends temporal receptive field transparently.
+      // Polyphase decomposition: N model instances, each processes every Nth sample.
+      // Effective temporal dilation = d*N in original time — no JSON scaling needed.
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
-      std::ifstream f(dspPath);
-      nlohmann::json j;
-      f >> j;
-      const auto scaledJson = _ScaleDilationsInJson(j, N);
-      mStagedModel = wrapModel(nam::get_dsp(scaledJson));
       mStagedPhaseModels.clear();
+      for (int p = 0; p < N; p++)
+        mStagedPhaseModels.push_back(wrapModel(nam::get_dsp(dspPath)));
+      mStagedModel = nullptr;
     }
     else
     {
