@@ -606,25 +606,8 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
     case kOversamplingFactor:
-      // Reload the model with new dilation scaling.
-      // Guard check avoids spurious reload during preset recall / unserialization.
-      NAM_LOG("[NAM] kOversamplingFactor changed: guard=%d pathLen=%d N=%d\n",
-              (int)mSlotParamGuard.load(), (int)mNAMPath.GetLength(),
-              kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
-      if (!mSlotParamGuard.load() && mNAMPath.GetLength())
-      {
-        NAM_LOG("[NAM] Requesting model reload for oversampling\n");
-        mSlotLoadRequest.store(-1);
-        mSlotWorkerCV.notify_one();
-      }
-      break;
     case kMulticoreEnabled:
-      // Changing multicore changes whether we use 1 or N model instances → reload.
-      if (!mSlotParamGuard.load() && mNAMPath.GetLength())
-      {
-        mSlotLoadRequest.store(-1);
-        mSlotWorkerCV.notify_one();
-      }
+      // Handled in OnParamChangeUI (UI thread) so the reload fires even without audio flowing.
       break;
     default:
       if (!mSlotParamGuard.load())
@@ -654,6 +637,21 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
 
 void NeuralAmpModeler::OnParamChangeUI(int paramIdx, EParamSource source)
 {
+  // Oversampling / multicore: trigger model reload from UI thread so it fires
+  // even when no audio is flowing through ProcessBlock.
+  if (paramIdx == kOversamplingFactor || paramIdx == kMulticoreEnabled)
+  {
+    NAM_LOG("[NAM] OnParamChangeUI: param=%d guard=%d pathLen=%d N=%d\n",
+            paramIdx, (int)mSlotParamGuard.load(), (int)mNAMPath.GetLength(),
+            kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
+    if (!mSlotParamGuard.load() && mNAMPath.GetLength())
+    {
+      NAM_LOG("[NAM] Triggering model reload from UI thread\n");
+      mSlotLoadRequest.store(-1);
+      mSlotWorkerCV.notify_one();
+    }
+  }
+
   if (auto pGraphics = GetUI())
   {
     bool active = GetParam(paramIdx)->Bool();
