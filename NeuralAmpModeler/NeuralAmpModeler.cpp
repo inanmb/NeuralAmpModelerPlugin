@@ -742,8 +742,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mPolyUpsampler.reset();
-    mPolyOutBuf.clear();
-    mPolyN = 1;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
     mModelCleared = true;
@@ -764,8 +762,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mPolyUpsampler.reset();
-    mPolyOutBuf.clear();
-    mPolyN = 1;
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
 
@@ -777,23 +773,22 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mPhaseModelsReady.load(std::memory_order_acquire) && !mStagedRawPhaseModels.empty())
   {
     mPhaseModelsReady.store(false, std::memory_order_relaxed);
-    // mStagedRawPhaseModels always has 1 element; N is the oversampling factor.
-    const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
-    NAM_LOG("[NAM] _ApplyDSPStaging: activating polyphase x%d (single model)\n", N);
+    const int N = (int)mStagedRawPhaseModels.size();
+    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models\n", N);
     mModel = nullptr;
     _StopPhaseWorkers();
-    mPolyN = N;
     mPhaseModels = std::move(mStagedPhaseModels);
     mRawPhaseModels = std::move(mStagedRawPhaseModels);
     mStagedPhaseModels.clear();
     mStagedRawPhaseModels.clear();
     mPolyUpBuf.clear();
-    mPolyOutBuf.clear();
-    // Shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
+    // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
     const double Fs = GetSampleRate();
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
-    // Single model processes N×nFrames sequentially; no worker threads needed.
+    // Start worker threads for phases 1..N-1
+    if (GetParam(kMulticoreEnabled)->Bool() && N > 1)
+      _StartPhaseWorkers(N - 1);
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
@@ -847,17 +842,16 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (pm) pm->Reset(sampleRate, maxBlockSize);
   for (auto& pm : mPhaseModels)
     if (pm) pm->Reset(sampleRate, maxBlockSize);
-  // Staged raw model may have been loaded at a different blockSize; re-prewarm at N×maxBlockSize.
   for (auto& pm : mStagedRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, mPolyN * maxBlockSize);
+    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
   for (auto& pm : mRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, mPolyN * maxBlockSize);
+    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
   if (mPolyUpsampler && !mRawPhaseModels.empty())
   {
+    const int N = (int)mRawPhaseModels.size();
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
-      (float)sampleRate, (float)(mPolyN * sampleRate));
+      (float)sampleRate, (float)(N * sampleRate));
     mPolyUpBuf.clear();
-    mPolyOutBuf.clear();
   }
 
   // IR
@@ -1132,13 +1126,15 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
 
-      // Single raw DSP instance processes N×nFrames at N×Fs (polyphase in, decimate out).
+      // N raw DSP instances for the audio path (no internal rate-conversion overhead).
       std::vector<std::unique_ptr<nam::DSP>> newRawModels;
+      newRawModels.reserve(N);
+      for (int p = 0; p < N; p++)
       {
         auto raw = nam::get_dsp(dspPath);
         if (raw->NumInputChannels() != 1 || raw->NumOutputChannels() != 1)
           throw std::runtime_error("Model must have exactly 1 input and 1 output channel");
-        raw->ResetAndPrewarm(GetSampleRate(), N * GetBlockSize());
+        raw->ResetAndPrewarm(GetSampleRate(), GetBlockSize());
         if (auto* s = dynamic_cast<nam::SlimmableModel*>(raw.get()))
           s->SetSlimmableSize(GetParam(kSlim)->Value());
         newRawModels.push_back(std::move(raw));
@@ -1417,34 +1413,64 @@ void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
 
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
-  const int N = mPolyN;
+  const int N = (int)mRawPhaseModels.size();
+  _EnsurePhaseBuffers(N, nFrames);
+
+  // 1. Upsample input: Fs → N×Fs via shared LanczosResampler.
+  //    Group delay ≈ kPolyphaseA samples at Fs.
   const int upLen = N * nFrames;
+  if ((int)mPolyUpBuf.size() < upLen)
+    mPolyUpBuf.assign(upLen, 0.0);
 
-  if ((int)mPolyUpBuf.size() < upLen) mPolyUpBuf.assign(upLen, 0.0);
-  if ((int)mPolyOutBuf.size() < upLen) mPolyOutBuf.assign(upLen, 0.0);
-
-  // 1. Upsample Fs → N×Fs. Group delay ≈ kPolyphaseA samples.
   mPolyUpsampler->PushBlock(input, (size_t)nFrames);
   {
     double* ptr = mPolyUpBuf.data();
     const size_t popped = mPolyUpsampler->PopBlock(&ptr, (size_t)upLen);
+    // Zero-pad during startup transient (first block only, inaudible).
     if ((int)popped < upLen)
       std::fill(mPolyUpBuf.begin() + popped, mPolyUpBuf.begin() + upLen, 0.0);
   }
 
-  // 2. Single model processes the full N×nFrames block at N×Fs.
-  double* inPtr = mPolyUpBuf.data();
-  double* outPtr = mPolyOutBuf.data();
-  mRawPhaseModels[0]->process(&inPtr, &outPtr, upLen);
+  // 2. Stride demux: phase p gets upsampled samples at indices p, N+p, 2N+p, ...
+  for (int p = 0; p < N; p++)
+    for (int i = 0; i < nFrames; i++)
+      mPhaseInputBufs[p][i] = mPolyUpBuf[i * N + p];
 
-  // 3. Decimate N:1: average every N consecutive output samples back to Fs.
-  const double scale = 1.0 / N;
+  // 3. Model processing (multicore or serial).
+  const bool multicore = GetParam(kMulticoreEnabled)->Bool();
+  if (multicore && (int)mPhaseWorkers.size() == N - 1)
+  {
+    for (int p = 1; p < N; p++)
+    {
+      auto& w = *mPhaseWorkers[p - 1];
+      w.input = &mPhaseInputPtrs[p];
+      w.output = &mPhaseOutputPtrs[p];
+      w.numFrames = nFrames;
+      w.model = mRawPhaseModels[p].get();
+      {std::lock_guard<std::mutex> lk(w.doneMtx); w.done = false;}
+      {std::lock_guard<std::mutex> lk(w.workMtx); w.workReady = true;}
+      w.workCV.notify_one();
+    }
+    mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
+    for (auto& w : mPhaseWorkers)
+    {
+      std::unique_lock<std::mutex> lk(w->doneMtx);
+      w->doneCV.wait(lk, [&w] { return w->done; });
+    }
+  }
+  else
+  {
+    for (int p = 0; p < N; p++)
+      mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
+  }
+
+  // 4. Downsample: average the N phase outputs.
+  //    Each model outputs at Fs; their average is the anti-aliased Fs signal.
   for (int i = 0; i < nFrames; i++)
   {
     double sum = 0.0;
-    const int base = i * N;
-    for (int p = 0; p < N; p++) sum += mPolyOutBuf[base + p];
-    output[0][i] = sum * scale;
+    for (int p = 0; p < N; p++) sum += mPhaseOutputBufs[p][i];
+    output[0][i] = sum / N;
   }
 }
 
