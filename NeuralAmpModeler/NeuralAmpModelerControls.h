@@ -790,7 +790,7 @@ public:
                              style.WithValueText(IText(12, EAlign::Center, PluginColors::HELP_TEXT))),
                            mControlNames.mcLabel);
       const auto mcSwitchArea = mcArea.GetReducedFromTop(16.0f).GetFromTop(NAM_SWTICH_HEIGHT).GetMidHPadded(50.0f);
-      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, "", mStyle, mSwitchBitmap),
+      AddNamedChildControl(new NAMSwitchControl(mcSwitchArea, kMulticoreEnabled, " ", mStyle, mSwitchBitmap),
                            mControlNames.mcSwitch, kCtrlTagMulticoreControl);
     }
 
