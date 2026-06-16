@@ -1415,15 +1415,16 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
   NAM_SAMPLE* outPtr = mModelOutF.data();
   mRawPhaseModels[0]->process(&inPtr, &outPtr, upLen);
 
-  // 4. Decimate: average N consecutive output samples → 1 output sample.
-  const float invN = 1.0f / static_cast<float>(N);
+  // 4. Decimate: stride-N subsampling — take mModelOutF[i*N].
+  //    The LanczosResampler places Fs grid points at multiples of N in the
+  //    upsampled buffer, so mModelOutF[i*N] is correctly time-aligned with
+  //    output sample i. Averaging N consecutive samples would introduce a
+  //    sinc roll-off (-2.6 dB at 20 kHz for N=32 at 48 kHz); stride-N avoids
+  //    that at no cost, since the WaveNet trained at Fs generates negligible
+  //    energy above Fs/2.
+  const NAM_SAMPLE* outBuf = mModelOutF.data();
   for (int i = 0; i < nFrames; i++)
-  {
-    float sum = 0.0f;
-    const NAM_SAMPLE* base = mModelOutF.data() + i * N;
-    for (int k = 0; k < N; k++) sum += base[k];
-    output[0][i] = static_cast<iplug::sample>(sum * invN);
-  }
+    output[0][i] = static_cast<iplug::sample>(outBuf[i * N]);
 }
 
 // HACK
