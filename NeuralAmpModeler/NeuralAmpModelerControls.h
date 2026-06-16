@@ -796,7 +796,7 @@ public:
 
     // Attach input/output calibration controls (compact, right below OS/MC section)
     {
-      const float calibTop = osMCArea.B + 8.0f;
+      const float calibTop = osMCArea.B + 20.0f;
       const float levelH = 28.0f;
       const float switchH = 32.0f;
       const float calibH = levelH + switchH + 8.0f;
