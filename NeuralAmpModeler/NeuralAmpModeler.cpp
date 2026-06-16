@@ -1,6 +1,8 @@
 #include <algorithm> // std::clamp, std::min
 #include <chrono>
 #include <cmath> // pow
+#include <cstdarg>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -23,6 +25,20 @@ using namespace iplug;
 using namespace igraphics;
 
 const double kDCBlockerFrequency = 5.0;
+
+// Temporary debug logging — writes to C:\NAM_debug.log
+static void _NAMLog(const char* fmt, ...)
+{
+  FILE* f = fopen("C:\\NAM_debug.log", "a");
+  if (!f) f = fopen("/tmp/NAM_debug.log", "a");
+  if (!f) return;
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(f, fmt, args);
+  va_end(args);
+  fclose(f);
+}
+#define NAM_LOG(...) _NAMLog(__VA_ARGS__)
 
 // Styles
 const IVColorSpec colorSpec{
@@ -592,12 +608,12 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kOversamplingFactor:
       // Reload the model with new dilation scaling.
       // Guard check avoids spurious reload during preset recall / unserialization.
-      fprintf(stderr, "[NAM] kOversamplingFactor changed: guard=%d pathLen=%d N=%d\n",
+      NAM_LOG("[NAM] kOversamplingFactor changed: guard=%d pathLen=%d N=%d\n",
               (int)mSlotParamGuard.load(), (int)mNAMPath.GetLength(),
               kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
       if (!mSlotParamGuard.load() && mNAMPath.GetLength())
       {
-        fprintf(stderr, "[NAM] Requesting model reload for oversampling\n");
+        NAM_LOG("[NAM] Requesting model reload for oversampling\n");
         mSlotLoadRequest.store(-1);
         mSlotWorkerCV.notify_one();
       }
@@ -738,7 +754,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   }
   if (!mStagedPhaseModels.empty())
   {
-    fprintf(stderr, "[NAM] _ApplyDSPStaging: activating %d phase models\n", (int)mStagedPhaseModels.size());
+    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models\n", (int)mStagedPhaseModels.size());
     mModel = nullptr;
     _StopPhaseWorkers();
     mPhaseModels = std::move(mStagedPhaseModels);
@@ -946,7 +962,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 
   const int req = mSlotLoadRequest.exchange(0);
-  fprintf(stderr, "[NAM] _ProcessSlotRequests: req=%d namPathLen=%d\n", req, (int)mNAMPath.GetLength());
+  NAM_LOG("[NAM] _ProcessSlotRequests: req=%d namPathLen=%d\n", req, (int)mNAMPath.GetLength());
   if (req == 0)
     return;
   // -1 = reload current model with updated oversampling factor
@@ -954,11 +970,11 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   {
     if (mNAMPath.GetLength())
     {
-      fprintf(stderr, "[NAM] Staging model with N=%d\n",
+      NAM_LOG("[NAM] Staging model with N=%d\n",
               kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
       std::lock_guard<std::mutex> lock(mStageMutex);
       _StageModel(mNAMPath);
-      fprintf(stderr, "[NAM] _StageModel done, stagedPhaseModels=%d\n", (int)mStagedPhaseModels.size());
+      NAM_LOG("[NAM] _StageModel done, stagedPhaseModels=%d\n", (int)mStagedPhaseModels.size());
     }
     return;
   }
