@@ -1,4 +1,6 @@
-#include <immintrin.h> // _mm_setcsr / _mm_getcsr for FTZ+DAZ per-thread
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h> // _mm_setcsr / _mm_getcsr for FTZ+DAZ per-thread (x86 only)
+#endif
 #include <algorithm> // std::clamp, std::min
 #include <chrono>
 #include <cmath> // pow
@@ -1447,8 +1449,10 @@ void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
     auto w = std::make_unique<PhaseWorker>();
     w->phaseIdx = i + 1;
     w->thread = std::thread([pw = w.get()] {
-      // Flush-to-zero + denormals-are-zero for this worker thread.
+      // Flush-to-zero + denormals-are-zero for this worker thread (x86 only).
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
       _mm_setcsr(_mm_getcsr() | 0x8040);
+#endif
       while (true)
       {
         nam::DSP* model = nullptr;
