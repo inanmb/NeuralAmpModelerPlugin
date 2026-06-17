@@ -18,11 +18,11 @@ jobs:
     runs-on: ${{matrix.os}}
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [windows-latest] # os: [macos-latest, windows-latest]
         include:
-          - os: macos-latest
-            build_dir: build-mac
-            artifact_ext: mac
+          # - os: macos-latest
+          #   build_dir: build-mac
+          #   artifact_ext: mac
           - os: windows-latest
             build_dir: build-win
             artifact_ext: win
@@ -45,12 +45,12 @@ jobs:
         ./download-prebuilt-libs.sh
       shell: bash
 
-    - name: Build macOS
-      if: matrix.os == 'macOS-latest'
-      run: |
-        cd ${{env.PROJECT_NAME}}/scripts
-        ./makedist-mac.sh full zip
-      shell: bash
+    # - name: Build macOS
+    #   if: matrix.os == 'macOS-latest'
+    #   run: |
+    #     cd ${{env.PROJECT_NAME}}/scripts
+    #     ./makedist-mac.sh full zip
+    #   shell: bash
 
     - name: Add msbuild to PATH (Windows)
       if: matrix.os == 'windows-latest'
