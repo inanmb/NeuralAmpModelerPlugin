@@ -4,8 +4,6 @@
 #include <algorithm> // std::clamp, std::min
 #include <chrono>
 #include <cmath> // pow
-#include <cstdarg>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -28,27 +26,6 @@ using namespace iplug;
 using namespace igraphics;
 
 const double kDCBlockerFrequency = 5.0;
-
-static void _NAMLog(const char* fmt, ...)
-{
-  // Try multiple locations in order
-  const char* paths[] = {
-    "C:\\temp\\NAM_debug.log",
-    "C:\\Users\\Public\\NAM_debug.log",
-    "C:\\NAM_debug.log",
-    nullptr
-  };
-  FILE* f = nullptr;
-  for (int i = 0; paths[i] && !f; i++)
-    f = fopen(paths[i], "a");
-  if (!f) return;
-  va_list args;
-  va_start(args, fmt);
-  vfprintf(f, fmt, args);
-  va_end(args);
-  fclose(f);
-}
-#define NAM_LOG(...) _NAMLog(__VA_ARGS__)
 
 // Styles
 const IVColorSpec colorSpec{
@@ -106,7 +83,6 @@ const double kDefaultInputCalibrationLevel = 12.0;
 NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 : Plugin(info, MakeConfig(kNumParams, kNumPresets))
 {
-  NAM_LOG("[NAM] Plugin constructor called — logging works\n");
   _InitToneStack();
   nam::activations::Activation::enable_fast_tanh();
   GetParam(kInputLevel)->InitGain("Input", 0.0, -20.0, 20.0, 0.1);
@@ -663,12 +639,8 @@ void NeuralAmpModeler::OnParamChangeUI(int paramIdx, EParamSource source)
   // even when no audio is flowing through ProcessBlock.
   if (paramIdx == kOversamplingFactor || paramIdx == kMulticoreEnabled)
   {
-    NAM_LOG("[NAM] OnParamChangeUI: param=%d guard=%d pathLen=%d N=%d\n",
-            paramIdx, (int)mSlotParamGuard.load(), (int)mNAMPath.GetLength(),
-            kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
     if (!mSlotParamGuard.load() && mNAMPath.GetLength())
     {
-      NAM_LOG("[NAM] Triggering model reload from UI thread\n");
       mSlotLoadRequest.store(-1);
       mSlotWorkerCV.notify_one();
     }
@@ -778,12 +750,11 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     _SetInputGain();
     _SetOutputGain();
   }
-  if (mPhaseModelsReady.load(std::memory_order_acquire) && !mStagedRawPhaseModels.empty())
+  if (mPhaseModelsReady.load(std::memory_order_acquire))
   {
     mPhaseModelsReady.store(false, std::memory_order_relaxed);
     mActivePolyphaseN = mStagedPolyphaseN;
     const int N = mActivePolyphaseN;
-    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models at Fs=%.0f (worker threads)\n", N, GetSampleRate());
     mModel = nullptr;
     mPhaseModels = std::move(mStagedPhaseModels);
     mRawPhaseModels = std::move(mStagedRawPhaseModels);
@@ -1032,7 +1003,6 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 
   const int req = mSlotLoadRequest.exchange(0);
-  NAM_LOG("[NAM] _ProcessSlotRequests: req=%d namPathLen=%d\n", req, (int)mNAMPath.GetLength());
   if (req == 0)
     return;
   // -1 = reload current model with updated oversampling factor
@@ -1040,11 +1010,8 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   {
     if (mNAMPath.GetLength())
     {
-      NAM_LOG("[NAM] Staging model with N=%d\n",
-              kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()]);
       std::lock_guard<std::mutex> lock(mStageMutex);
       _StageModel(mNAMPath);
-      NAM_LOG("[NAM] _StageModel done, stagedPhaseModels=%d\n", (int)mStagedRawPhaseModels.size());
     }
     return;
   }
@@ -1106,25 +1073,6 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 }
 
-// Scale all WaveNet dilation values in a .nam JSON by factor N.
-// Scales WaveNet dilation values by factor to extend the model's temporal receptive field.
-static nlohmann::json _ScaleDilationsInJson(const nlohmann::json& j, int factor)
-{
-  if (factor <= 1)
-    return j;
-  auto scaled = j;
-  if (scaled.value("architecture", "") == "WaveNet")
-  {
-    auto& layers = scaled["config"]["layers"];
-    for (auto& layer : layers)
-    {
-      auto& dilations = layer["dilations"];
-      for (auto& d : dilations)
-        d = d.get<int>() * factor;
-    }
-  }
-  return scaled;
-}
 
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
@@ -1471,10 +1419,11 @@ void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
         }
         if (model && in && out)
           model->process(in, out, nf);
-        {
-          std::lock_guard<std::mutex> lk(pw->doneMtx);
-          pw->done = true;
-        }
+        // Release store so the audio thread's acquire load sees the completed work.
+        pw->done.store(true, std::memory_order_release);
+        // Acquire workMtx before notify to prevent the audio thread's wait from
+        // missing the notification if it hasn't called wait yet.
+        { std::lock_guard<std::mutex> lk(pw->workMtx); }
         pw->doneCV.notify_one();
       }
     });
@@ -1539,7 +1488,7 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
         w.output = &mPhaseOutputPtrs[p];
         w.numFrames = nFrames;
         w.model = mRawPhaseModels[p].get();
-        w.done = false;
+        w.done.store(false, std::memory_order_relaxed);
         w.workReady = true;
       }
       w.workCV.notify_one();
@@ -1550,8 +1499,8 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
     for (int p = 1; p < N; p++)
     {
       auto& w = *mPhaseWorkers[p - 1];
-      std::unique_lock<std::mutex> lk(w.doneMtx);
-      w.doneCV.wait(lk, [&w] { return w.done; });
+      std::unique_lock<std::mutex> lk(w.workMtx);
+      w.doneCV.wait(lk, [&w] { return w.done.load(std::memory_order_acquire); });
     }
   }
 

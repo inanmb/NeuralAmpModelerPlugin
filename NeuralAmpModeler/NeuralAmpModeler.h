@@ -326,9 +326,9 @@ private:
     std::condition_variable workCV;
     bool workReady = false;
     bool quit = false;
-    std::mutex doneMtx;
-    std::condition_variable doneCV;
-    bool done = true;
+    // atomic: written by worker, read by audio thread — avoids data race (no shared mutex needed).
+    std::atomic<bool> done{true};
+    std::condition_variable doneCV; // waited and notified under workMtx
   };
   std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
 
