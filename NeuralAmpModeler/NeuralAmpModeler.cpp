@@ -1417,8 +1417,14 @@ void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
           nf = pw->numFrames;
           pw->workReady = false;
         }
-        if (model && in && out)
-          model->process(in, out, nf);
+        // Wrap in try/catch: if the model throws, the worker must still signal
+        // completion so the audio thread doesn't block indefinitely.
+        try
+        {
+          if (model && in && out)
+            model->process(in, out, nf);
+        }
+        catch (...) {}
         // Release store so the audio thread's acquire load sees the completed work.
         pw->done.store(true, std::memory_order_release);
         // Acquire workMtx before notify to prevent the audio thread's wait from
