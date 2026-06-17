@@ -311,6 +311,26 @@ private:
   // Polyphase (oversampling) helpers
   void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
   void _EnsurePhaseBuffers(int N, int framesPerPhase);
+  void _StartPhaseWorkers(int numWorkers);
+  void _StopPhaseWorkers();
+
+  struct PhaseWorker
+  {
+    std::thread thread;
+    int phaseIdx = 0;
+    NAM_SAMPLE** input = nullptr;
+    NAM_SAMPLE** output = nullptr;
+    int numFrames = 0;
+    nam::DSP* model = nullptr;
+    std::mutex workMtx;
+    std::condition_variable workCV;
+    bool workReady = false;
+    bool quit = false;
+    std::mutex doneMtx;
+    std::condition_variable doneCV;
+    bool done = true;
+  };
+  std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);

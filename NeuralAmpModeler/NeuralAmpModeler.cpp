@@ -1,3 +1,4 @@
+#include <immintrin.h> // _mm_setcsr / _mm_getcsr for FTZ+DAZ per-thread
 #include <algorithm> // std::clamp, std::min
 #include <chrono>
 #include <cmath> // pow
@@ -360,6 +361,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
+  _StopPhaseWorkers();
   {
     std::lock_guard<std::mutex> lock(mSlotWorkerMutex);
     mSlotWorkerStop = true;
@@ -740,6 +742,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Remove marked modules
   if (mShouldRemoveModel)
   {
+    _StopPhaseWorkers();
     mModel = nullptr;
     mPhaseModels.clear();
     mRawPhaseModels.clear();
@@ -761,6 +764,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
+    _StopPhaseWorkers();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mPolyUpsampler.reset();
@@ -806,11 +810,10 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
 
-    // Warm up the OpenMP thread pool so the first audio block doesn't pay
-    // thread-creation cost. The parallel region is a no-op work-wise.
-    #pragma omp parallel for schedule(static) num_threads(N)
-    for (int p = 0; p < N; p++)
-      (void)p;
+    // Start N-1 sleeping worker threads (phases 1..N-1).
+    // Phase 0 always runs on the audio thread.
+    if (N > 1)
+      _StartPhaseWorkers(N - 1);
 
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
@@ -1435,6 +1438,62 @@ void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
   }
 }
 
+void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
+{
+  _StopPhaseWorkers();
+  mPhaseWorkers.reserve(numWorkers);
+  for (int i = 0; i < numWorkers; i++)
+  {
+    auto w = std::make_unique<PhaseWorker>();
+    w->phaseIdx = i + 1;
+    w->thread = std::thread([pw = w.get()] {
+      // Flush-to-zero + denormals-are-zero for this worker thread.
+      _mm_setcsr(_mm_getcsr() | 0x8040);
+      while (true)
+      {
+        nam::DSP* model = nullptr;
+        NAM_SAMPLE** in = nullptr;
+        NAM_SAMPLE** out = nullptr;
+        int nf = 0;
+        {
+          std::unique_lock<std::mutex> lk(pw->workMtx);
+          pw->workCV.wait(lk, [pw] { return pw->workReady || pw->quit; });
+          if (pw->quit)
+            break;
+          model = pw->model;
+          in = pw->input;
+          out = pw->output;
+          nf = pw->numFrames;
+          pw->workReady = false;
+        }
+        if (model && in && out)
+          model->process(in, out, nf);
+        {
+          std::lock_guard<std::mutex> lk(pw->doneMtx);
+          pw->done = true;
+        }
+        pw->doneCV.notify_one();
+      }
+    });
+    mPhaseWorkers.push_back(std::move(w));
+  }
+}
+
+void NeuralAmpModeler::_StopPhaseWorkers()
+{
+  for (auto& w : mPhaseWorkers)
+  {
+    {
+      std::lock_guard<std::mutex> lk(w->workMtx);
+      w->quit = true;
+    }
+    w->workCV.notify_one();
+    if (w->thread.joinable())
+      w->thread.join();
+  }
+  mPhaseWorkers.clear();
+}
+
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = mActivePolyphaseN;
@@ -1457,11 +1516,41 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
     for (int i = 0; i < nFrames; i++)
       mPhaseInputBufs[p][i] = static_cast<NAM_SAMPLE>(mPolyUpBuf[i * N + p]);
 
-  // 3. Process N independent phases in parallel via OpenMP.
-  //    Each phase has its own DSP state and scratch buffers — no data races.
-  #pragma omp parallel for schedule(static)
-  for (int p = 0; p < N; p++)
-    mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
+  // 3. Process N independent phases in parallel.
+  //    Phase 0 runs on the audio thread; phases 1..N-1 run on sleeping worker threads.
+  if (mPhaseWorkers.empty())
+  {
+    // Serial fallback (N=1 or workers not yet started).
+    for (int p = 0; p < N; p++)
+      mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
+  }
+  else
+  {
+    // Dispatch phases 1..N-1 to background workers.
+    for (int p = 1; p < N; p++)
+    {
+      auto& w = *mPhaseWorkers[p - 1];
+      {
+        std::lock_guard<std::mutex> lk(w.workMtx);
+        w.input = &mPhaseInputPtrs[p];
+        w.output = &mPhaseOutputPtrs[p];
+        w.numFrames = nFrames;
+        w.model = mRawPhaseModels[p].get();
+        w.done = false;
+        w.workReady = true;
+      }
+      w.workCV.notify_one();
+    }
+    // Phase 0 on the audio thread.
+    mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
+    // Wait for all workers.
+    for (int p = 1; p < N; p++)
+    {
+      auto& w = *mPhaseWorkers[p - 1];
+      std::unique_lock<std::mutex> lk(w.doneMtx);
+      w.doneCV.wait(lk, [&w] { return w.done; });
+    }
+  }
 
   // 4. Average N phase outputs → anti-aliased output at Fs.
   const float invN = 1.0f / static_cast<float>(N);
