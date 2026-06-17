@@ -29,7 +29,6 @@ using namespace igraphics;
 
 const double kDCBlockerFrequency = 5.0;
 
-// Temporary debug logging
 static void _NAMLog(const char* fmt, ...)
 {
   // Try multiple locations in order
@@ -784,7 +783,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mPhaseModelsReady.store(false, std::memory_order_relaxed);
     mActivePolyphaseN = mStagedPolyphaseN;
     const int N = mActivePolyphaseN;
-    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models at Fs=%.0f (OpenMP)\n", N, GetSampleRate());
+    NAM_LOG("[NAM] _ApplyDSPStaging: activating %d phase models at Fs=%.0f (worker threads)\n", N, GetSampleRate());
     mModel = nullptr;
     mPhaseModels = std::move(mStagedPhaseModels);
     mRawPhaseModels = std::move(mStagedRawPhaseModels);
@@ -1154,7 +1153,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       if (!std::filesystem::exists(dspPath))
         throw std::runtime_error("Config file doesn't exist!\n");
 
-      // N independent raw DSPs at Fs — one per phase, parallelised via OpenMP.
+      // N independent raw DSPs at Fs — one per phase, parallelised via worker threads.
       std::vector<std::unique_ptr<nam::DSP>> newRawModels;
       newRawModels.reserve(N);
       for (int p = 0; p < N; p++)

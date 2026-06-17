@@ -431,7 +431,7 @@ private:
 
   NAMSender mInputSender, mOutputSender;
 
-  // === Polyphase oversampling (N raw DSPs at Fs, OpenMP parallelism) ===
+  // === Polyphase oversampling (N raw DSPs at Fs, sleeping worker threads) ===
   // Metadata model (ResamplingNAM, 1 when N>1) — NOT in the audio path.
   std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
   std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
