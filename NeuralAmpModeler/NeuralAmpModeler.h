@@ -451,7 +451,7 @@ private:
   std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
 
   // Shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples at Fs.
-  static constexpr int kPolyphaseA = 52;
+  static constexpr int kPolyphaseA = 32;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
   std::vector<double> mPolyUpBuf;   // N×nFrames upsampled buffer (double)
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
