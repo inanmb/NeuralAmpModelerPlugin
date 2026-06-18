@@ -568,9 +568,13 @@ void NeuralAmpModeler::OnUIOpen()
   if (mNAMPath.GetLength())
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
-    // If it's not loaded yet, then mark as failed.
-    // If it's yet to be loaded, then the completion handler will set us straight once it runs.
-    if (mModel == nullptr && mStagedModel == nullptr)
+    // Mark as failed only if no model is live or staged (including polyphase path).
+    // If loading is still in progress, the completion handler will correct the display.
+    const bool hasLiveModel   = mModel != nullptr || !mRawPhaseModels.empty();
+    const bool hasStagedModel = mStagedModel != nullptr
+                                || !mStagedRawPhaseModels.empty()
+                                || mPhaseModelsReady.load(std::memory_order_acquire);
+    if (!hasLiveModel && !hasStagedModel)
       SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
   }
 
