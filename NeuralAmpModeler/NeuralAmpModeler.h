@@ -169,8 +169,7 @@ public:
     // _prewarm_samples = 0;
 
     // And be ready
-    int maxBlockSize = 2048; // Conservative
-    Reset(expected_sample_rate, maxBlockSize);
+    Reset(expected_sample_rate, 2048); // provisional size; overridden by Reset() in _StageModel
   };
 
   ~ResamplingNAM() = default;
