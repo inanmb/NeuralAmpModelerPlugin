@@ -783,9 +783,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
-    // Init Lanczos downsampler (N×Fs → Fs) for anti-aliased reconstruction.
-    mPolyDownsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
-      (float)(N * Fs), (float)Fs);
+    // Init causal polyphase synthesis filter for alias-free reconstruction.
+    _InitPolyphaseFilter(N);
 
     // Start N-1 sleeping worker threads (phases 1..N-1).
     // Phase 0 always runs on the audio thread.
@@ -1353,7 +1352,7 @@ void NeuralAmpModeler::_UpdateLatency()
   {
     // Shared Lanczos upsampler group delay ≈ kPolyphaseA samples at Fs.
     // No output ring buffer in the new architecture.
-    latency += kPolyphaseA;
+    latency += 2 * kPolyphaseA;
   }
 
   // VST3 requires SetLatency to be called from the UI thread.
@@ -1457,6 +1456,32 @@ void NeuralAmpModeler::_StopPhaseWorkers()
   mPhaseWorkers.clear();
 }
 
+void NeuralAmpModeler::_InitPolyphaseFilter(int N)
+{
+  const int taps = 2 * kPolyphaseA + 1;
+  mPolySynthCoeffs.assign(N, std::vector<double>(taps, 0.0));
+  mPolySynthHistory.assign(N, std::vector<double>(taps, 0.0));
+  mPolySynthHistPos.assign(N, 0);
+
+  for (int p = 0; p < N; p++)
+    for (int j = 0; j < taps; j++)
+    {
+      // Causal Lanczos synthesis coefficient for phase p, tap j.
+      // x = (j - A) + p/N places the prototype filter peak at j=A with phase offset p/N.
+      const double x = (j - kPolyphaseA) + static_cast<double>(p) / N;
+      double coeff;
+      if (std::abs(x) < 1e-7)
+        coeff = 1.0 / N;
+      else if (std::abs(x) >= kPolyphaseA)
+        coeff = 0.0;
+      else
+        coeff = (std::sin(M_PI * x) / (M_PI * x))
+              * (std::sin(M_PI * x / kPolyphaseA) / (M_PI * x / kPolyphaseA))
+              / N;
+      mPolySynthCoeffs[p][j] = coeff;
+    }
+}
+
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = mActivePolyphaseN;
@@ -1515,23 +1540,21 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
     }
   }
 
-  // 4. Downsample: push N interleaved samples per output sample via Lanczos.
-  //    Pushing all N×nFrames at once would overflow the resampler's 4096-sample
-  //    internal buffer at high N — so we push one group of N per output sample.
-  if ((int)mPolyDownBuf.size() < N)
-    mPolyDownBuf.assign(N, 0.0);
-
-  double sampleOut = 0.0;
-  double* samplePtr = &sampleOut;
-
+  // 4. Polyphase synthesis: causal Lanczos filter per phase, summed to Fs output.
+  //    Delay = kPolyphaseA samples at Fs; combined with upsampler: 2×kPolyphaseA total.
+  const int taps = 2 * kPolyphaseA + 1;
   for (int i = 0; i < nFrames; i++)
   {
+    double sum = 0.0;
     for (int p = 0; p < N; p++)
-      mPolyDownBuf[p] = static_cast<double>(mPhaseOutputBufs[p][i]);
-    double* grp = mPolyDownBuf.data();
-    mPolyDownsampler->PushBlock(&grp, (size_t)N);
-    const size_t popped = mPolyDownsampler->PopBlock(&samplePtr, 1);
-    output[0][i] = popped > 0 ? static_cast<iplug::sample>(sampleOut) : 0.0;
+    {
+      const int hp = mPolySynthHistPos[p];
+      mPolySynthHistory[p][hp] = static_cast<double>(mPhaseOutputBufs[p][i]);
+      for (int j = 0; j < taps; j++)
+        sum += mPolySynthCoeffs[p][j] * mPolySynthHistory[p][(hp - j + taps) % taps];
+      mPolySynthHistPos[p] = (hp + 1) % taps;
+    }
+    output[0][i] = static_cast<iplug::sample>(sum);
   }
 }
 

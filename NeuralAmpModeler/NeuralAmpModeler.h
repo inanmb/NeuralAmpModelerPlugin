@@ -343,6 +343,7 @@ private:
 
   // Make sure that the latency is reported correctly.
   void _UpdateLatency();
+  void _InitPolyphaseFilter(int N);
 
   // Update level meters
   // Called within ProcessBlock().
@@ -454,7 +455,10 @@ private:
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
   std::vector<double> mPolyUpBuf;   // N×nFrames upsampled buffer (double)
-  std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyDownsampler;
-  std::vector<double> mPolyDownBuf; // N×nFrames interleaved buffer for downsampling
+  // Polyphase synthesis filter (causal Lanczos, precomputed per-phase coefficients).
+  // Delays output by kPolyphaseA frames at Fs; total latency = 2×kPolyphaseA.
+  std::vector<std::vector<double>> mPolySynthCoeffs;  // [N][2*A+1]
+  std::vector<std::vector<double>> mPolySynthHistory; // [N][2*A+1] circular history
+  std::vector<int>                 mPolySynthHistPos; // [N] write positions
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
 };
