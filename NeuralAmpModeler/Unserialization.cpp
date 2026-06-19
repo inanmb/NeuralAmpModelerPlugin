@@ -57,8 +57,8 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
   OnParamReset(iplug::EParamSource::kPresetRecall);
   LEAVE_PARAMS_MUTEX
 
-  mNAMPath.Set(static_cast<std::string>(config["NAMPath"]).c_str());
-  mIRPath.Set(static_cast<std::string>(config["IRPath"]).c_str());
+  mNAMPath.Set(config.value("NAMPath", "").c_str());
+  mIRPath.Set(config.value("IRPath", "").c_str());
 
   // Model slots
   for (int i = 0; i < kNumModelSlots; i++)
@@ -353,8 +353,7 @@ int NeuralAmpModeler::_UnserializeStateWithKnownVersion(const iplug::IByteChunk&
   }
   else
   {
-    // You shouldn't be here...
-    assert(false);
+    throw std::runtime_error("Unrecognized preset version");
   }
   _UnserializeApplyConfig(config);
   return pos;
