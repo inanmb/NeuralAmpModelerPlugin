@@ -617,6 +617,7 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneMid: mToneStack->SetParam("middle", GetParam(paramIdx)->Value()); break;
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
+    case kIRToggle: mIRToggleAtomic.store(GetParam(kIRToggle)->Bool()); break;
     case kOversamplingFactor:
     case kMulticoreEnabled:
       // Handled in OnParamChangeUI (UI thread) so the reload fires even without audio flowing.
@@ -877,16 +878,12 @@ void NeuralAmpModeler::_SetOutputGain()
 void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
 {
   const double v = GetParam(kSlim)->Value();
-  auto applyWrapped = [v](ResamplingNAM* p) {
+  auto apply = [v](ResamplingNAM* p) {
     if (p && p->GetSlimmableModel())
       p->GetSlimmableModel()->SetSlimmableSize(v);
   };
-  auto applyRaw = [v](nam::DSP* p) {
-    if (auto* s = dynamic_cast<nam::SlimmableModel*>(p))
-      s->SetSlimmableSize(v);
-  };
-  applyWrapped(mModel.get());
-  applyWrapped(mStagedModel.get());
+  apply(mModel.get());
+  apply(mStagedModel.get());
 }
 
 void NeuralAmpModeler::_SetSlotParamValue(int paramIdx, int value)
@@ -931,7 +928,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
     SlotState& s = mSlots[assign - 1];
     s.namPath = mNAMPath;
     s.irPath = mIRPath;
-    s.irToggle = (bool)GetParam(kIRToggle)->Value();
+    s.irToggle = mIRToggleAtomic.load();
     s.params.clear();
     // Capture all params except the slot-control params
     for (int i = 0; i < kNumParams; i++)
