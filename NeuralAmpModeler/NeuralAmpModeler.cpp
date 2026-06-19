@@ -415,6 +415,24 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   sample** hpfPointers = mHighPass.Process(irPointers, numChannelsInternal, numFrames);
   // sample** lpfPointers = mLowPass.Process(hpfPointers, numChannelsInternal, numFrames);
 
+  // Deferred model swap at zero-crossing of fade-out
+  if (mTransitionFadingOut && mTransitionSamplesRemaining <= 0)
+  {
+    if (mStagedModel != nullptr)
+    {
+      mModel = std::move(mStagedModel);
+      mStagedModel = nullptr;
+      mNewModelLoadedInDSP = true;
+      _UpdateLatency();
+      _SetInputGain();
+      _SetOutputGain();
+    }
+    mTransitionFadingOut = false;
+    mTransitionFadingIn  = true;
+    mTransitionSamplesRemaining = mTransitionLength;
+  }
+  _ApplyTransitionGain(hpfPointers, numFrames, numChannelsInternal);
+
   // restore previous floating point state
   std::feupdateenv(&fe_state);
 
@@ -710,6 +728,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Remove marked modules
   if (mShouldRemoveModel)
   {
+    mTransitionFadingOut = false;
+    mTransitionFadingIn  = false;
     mModel = nullptr;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
@@ -724,16 +744,30 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mIRPath.Set("");
     mShouldRemoveIR = false;
   }
-  // Move things from staged to live
-  if (mStagedModel != nullptr)
+  // Move things from staged to live (with fade transition if a model is already active)
+  if (mStagedModel != nullptr && !mTransitionFadingOut && !mTransitionFadingIn)
   {
-    mModel = std::move(mStagedModel);
-    mStagedModel = nullptr;
-
-    mNewModelLoadedInDSP = true;
-    _UpdateLatency();
-    _SetInputGain();
-    _SetOutputGain();
+    if (mModel != nullptr)
+    {
+      // A model is live: start fade-out, defer the swap
+      mTransitionLength = std::max(32, static_cast<int>(0.010 * GetSampleRate()));
+      mTransitionSamplesRemaining = mTransitionLength;
+      mTransitionFadingOut = true;
+      // mStagedModel stays put until fade-out completes in ProcessBlock
+    }
+    else
+    {
+      // Nothing live: swap immediately and fade-in
+      mModel = std::move(mStagedModel);
+      mStagedModel = nullptr;
+      mNewModelLoadedInDSP = true;
+      _UpdateLatency();
+      _SetInputGain();
+      _SetOutputGain();
+      mTransitionLength = std::max(32, static_cast<int>(0.010 * GetSampleRate()));
+      mTransitionSamplesRemaining = mTransitionLength;
+      mTransitionFadingIn = true;
+    }
   }
   if (mStagedIR != nullptr)
   {
@@ -1232,6 +1266,28 @@ void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPoint
 }
 
 
+
+void NeuralAmpModeler::_ApplyTransitionGain(sample** outputs, size_t nFrames, size_t nChans)
+{
+  if (!mTransitionFadingOut && !mTransitionFadingIn)
+    return;
+  const int len = std::max(1, mTransitionLength);
+  for (size_t s = 0; s < nFrames; s++)
+  {
+    double gain;
+    if (mTransitionFadingOut)
+      gain = static_cast<double>(mTransitionSamplesRemaining) / static_cast<double>(len);
+    else
+      gain = 1.0 - static_cast<double>(mTransitionSamplesRemaining) / static_cast<double>(len);
+    gain = std::clamp(gain, 0.0, 1.0);
+    for (size_t c = 0; c < nChans; c++)
+      outputs[c][s] *= gain;
+    if (mTransitionSamplesRemaining > 0)
+      --mTransitionSamplesRemaining;
+  }
+  if (mTransitionSamplesRemaining <= 0 && mTransitionFadingIn)
+    mTransitionFadingIn = false;
+}
 
 // HACK
 #include "Unserialization.cpp"

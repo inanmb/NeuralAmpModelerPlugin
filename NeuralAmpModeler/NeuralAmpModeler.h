@@ -641,6 +641,7 @@ private:
   void _SetInputGain();
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
+  void _ApplyTransitionGain(iplug::sample** outputs, size_t nFrames, size_t nChans);
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -691,6 +692,12 @@ private:
 
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;
+
+  // Fade-in/fade-out when switching models (audio thread only)
+  bool mTransitionFadingOut = false;
+  bool mTransitionFadingIn  = false;
+  int  mTransitionSamplesRemaining = 0;
+  int  mTransitionLength = 0;
   // Pending latency value to apply on the UI thread (VST3 requires SetLatency from UI thread).
   // -1 means no pending update.
   std::atomic<int> mPendingLatency{-1};
