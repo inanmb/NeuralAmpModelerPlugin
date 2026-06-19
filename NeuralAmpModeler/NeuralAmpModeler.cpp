@@ -1515,16 +1515,24 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
     }
   }
 
-  // 4. Interleave N phase outputs → N×Fs buffer, then Lanczos downsample → Fs.
-  const int downLen = N * nFrames;
-  if ((int)mPolyDownBuf.size() < downLen)
-    mPolyDownBuf.assign(downLen, 0.0);
+  // 4. Downsample: push N interleaved samples per output sample via Lanczos.
+  //    Pushing all N×nFrames at once would overflow the resampler's 4096-sample
+  //    internal buffer at high N — so we push one group of N per output sample.
+  if ((int)mPolyDownBuf.size() < N)
+    mPolyDownBuf.assign(N, 0.0);
+
+  double sampleOut = 0.0;
+  double* samplePtr = &sampleOut;
+
   for (int i = 0; i < nFrames; i++)
+  {
     for (int p = 0; p < N; p++)
-      mPolyDownBuf[i * N + p] = static_cast<double>(mPhaseOutputBufs[p][i]);
-  double* downPtr = mPolyDownBuf.data();
-  mPolyDownsampler->PushBlock(&downPtr, (size_t)downLen);
-  mPolyDownsampler->PopBlock(output, (size_t)nFrames);
+      mPolyDownBuf[p] = static_cast<double>(mPhaseOutputBufs[p][i]);
+    double* grp = mPolyDownBuf.data();
+    mPolyDownsampler->PushBlock(&grp, (size_t)N);
+    const size_t popped = mPolyDownsampler->PopBlock(&samplePtr, 1);
+    output[0][i] = popped > 0 ? static_cast<iplug::sample>(sampleOut) : 0.0;
+  }
 }
 
 // HACK
