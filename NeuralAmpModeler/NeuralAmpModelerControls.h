@@ -796,9 +796,9 @@ public:
 
     // Attach input/output calibration controls (compact, right below OS/MC section)
     {
-      const float calibTop = osMCArea.B + 20.0f;
+      const float calibTop = osMCArea.B + 30.0f;
       const float levelH = 28.0f;
-      const float switchH = 32.0f;
+      const float switchH = 46.0f;
       const float calibH = levelH + switchH + 8.0f;
       const auto inputOutputArea = IRECT{osMCArea.L, calibTop, osMCArea.R, calibTop + calibH};
       const auto inputArea = inputOutputArea.GetFromLeft(0.5f * sectionWidth);
