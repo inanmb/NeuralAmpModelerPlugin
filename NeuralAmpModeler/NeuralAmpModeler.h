@@ -590,4 +590,10 @@ private:
   std::vector<NAM_SAMPLE> mHiBufA;
   std::vector<NAM_SAMPLE> mHiBufB;
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
+
+  // Per-phase input/output buffers (N × maxBlockSize), used in polyphase path.
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseInBufs;
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutBufs;
+  // Active thread pool for parallel phase processing.
+  std::shared_ptr<PhaseMulticorePool> mPhasePool;
 };

@@ -772,9 +772,16 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mDownStages.assign(static_cast<size_t>(nStages), HalfBandFilter{});
     mHiBufA.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
     mHiBufB.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
-    // Prepare single raw model for N×Fs operation (only [0] is used in IIR path).
-    if (!mRawPhaseModels.empty() && mRawPhaseModels[0])
-      mRawPhaseModels[0]->ResetAndPrewarm(GetSampleRate(), N * blockSize);
+    // Reset each raw model at base Fs with base blockSize (polyphase path).
+    for (auto& rm : mRawPhaseModels)
+      if (rm) rm->ResetAndPrewarm(GetSampleRate(), blockSize);
+    // Per-phase scratch buffers.
+    mPhaseInBufs.assign(static_cast<size_t>(N), std::vector<NAM_SAMPLE>(static_cast<size_t>(blockSize), NAM_SAMPLE(0)));
+    mPhaseOutBufs.assign(static_cast<size_t>(N), std::vector<NAM_SAMPLE>(static_cast<size_t>(blockSize), NAM_SAMPLE(0)));
+    // Thread pool: honour the multicore toggle.
+    const int multicoreOn = GetParam(kMulticoreEnabled)->Bool() ? 1 : 0;
+    const int nThreads = multicoreOn ? std::min(N, (int)std::thread::hardware_concurrency()) : 1;
+    mPhasePool = _GetPhasePool(nThreads);
 
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
@@ -829,16 +836,19 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (pm) pm->Reset(sampleRate, maxBlockSize);
   for (auto& pm : mPhaseModels)
     if (pm) pm->Reset(sampleRate, maxBlockSize);
-  if (!mStagedRawPhaseModels.empty() && mStagedRawPhaseModels[0])
-    mStagedRawPhaseModels[0]->ResetAndPrewarm(sampleRate, mStagedPolyphaseN * maxBlockSize);
-  if (!mRawPhaseModels.empty() && mRawPhaseModels[0] && !mUpStages.empty())
+  for (auto& rm : mStagedRawPhaseModels)
+    if (rm) rm->ResetAndPrewarm(sampleRate, maxBlockSize);
+  if (!mRawPhaseModels.empty() && !mUpStages.empty())
   {
     const int N = mActivePolyphaseN;
-    mRawPhaseModels[0]->ResetAndPrewarm(sampleRate, N * maxBlockSize);
+    for (auto& rm : mRawPhaseModels)
+      if (rm) rm->ResetAndPrewarm(sampleRate, maxBlockSize);
     for (auto& s : mUpStages)   s.Reset();
     for (auto& s : mDownStages) s.Reset();
     mHiBufA.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
     mHiBufB.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
+    for (auto& v : mPhaseInBufs)  v.assign(static_cast<size_t>(maxBlockSize), NAM_SAMPLE(0));
+    for (auto& v : mPhaseOutBufs) v.assign(static_cast<size_t>(maxBlockSize), NAM_SAMPLE(0));
   }
 
   // IR
@@ -1371,11 +1381,29 @@ void NeuralAmpModeler::_ProcessIIROversample(iplug::sample** input, iplug::sampl
     std::swap(cur, alt);
   }
   // cur → upsampled high-rate signal (curN = N * nFrames), alt → scratch
+  const int N = mActivePolyphaseN;
 
-  // Single NAM model processes the full high-rate block.
-  NAM_SAMPLE* hiIn  = cur;
+  // Stride demux: interleaved high-rate → N phase buffers at base Fs.
+  NAM_SAMPLE* hiIn = cur;
+  for (int p = 0; p < N; p++)
+    for (int n = 0; n < nFrames; n++)
+      mPhaseInBufs[static_cast<size_t>(p)][static_cast<size_t>(n)] = hiIn[n * N + p];
+
+  // Parallel NAM processing: N models × nFrames at base Fs.
+  auto& rawModels = mRawPhaseModels;
+  auto& phaseIn   = mPhaseInBufs;
+  auto& phaseOut  = mPhaseOutBufs;
+  mPhasePool->ParallelFor(N, [&](int p) {
+    NAM_SAMPLE* pIn  = phaseIn[static_cast<size_t>(p)].data();
+    NAM_SAMPLE* pOut = phaseOut[static_cast<size_t>(p)].data();
+    rawModels[static_cast<size_t>(p)]->process(&pIn, &pOut, nFrames);
+  });
+
+  // Stride mux: N phase buffers → interleaved high-rate.
   NAM_SAMPLE* hiOut = alt;
-  mRawPhaseModels[0]->process(&hiIn, &hiOut, curN);
+  for (int p = 0; p < N; p++)
+    for (int n = 0; n < nFrames; n++)
+      hiOut[n * N + p] = phaseOut[static_cast<size_t>(p)][static_cast<size_t>(n)];
 
   // Cascade downsample (reverse stage order, same filters).
   cur = hiOut;
