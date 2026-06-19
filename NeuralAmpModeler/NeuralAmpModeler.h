@@ -343,7 +343,6 @@ private:
 
   // Make sure that the latency is reported correctly.
   void _UpdateLatency();
-  void _InitPolyphaseFilter(int N);
 
   // Update level meters
   // Called within ProcessBlock().
@@ -451,14 +450,11 @@ private:
   std::vector<NAM_SAMPLE*> mPhaseInputPtrs;
   std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
 
-  // Shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples at Fs.
-  static constexpr int kPolyphaseA = 52;
-  std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
-  std::vector<double> mPolyUpBuf;   // N×nFrames upsampled buffer (double)
-  // Polyphase synthesis filter (causal Lanczos, precomputed per-phase coefficients).
-  // Delays output by kPolyphaseA frames at Fs; total latency = 2×kPolyphaseA.
-  std::vector<std::vector<double>> mPolySynthCoeffs;  // [N][2*A+1]
-  std::vector<std::vector<double>> mPolySynthHistory; // [N][2*A+1] circular history
-  std::vector<int>                 mPolySynthHistPos; // [N] write positions
+  // Oversampling via two back-to-back Lanczos resamplers (Fs→N×Fs→Fs).
+  // Latency ≈ kOversamplingA samples at Fs; reported automatically via GetLatency().
+  static constexpr int kOversamplingA = 32;
+  std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, kOversamplingA>> mOversamplingContainer;
+  std::vector<NAM_SAMPLE> mHighRateInBuf;   // scratch for high-rate input (inside callback)
+  std::vector<NAM_SAMPLE> mHighRateOutBuf;  // scratch for high-rate output (inside callback)
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
 };

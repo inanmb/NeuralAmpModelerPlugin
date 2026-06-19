@@ -721,7 +721,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mModel = nullptr;
     mPhaseModels.clear();
     mRawPhaseModels.clear();
-    mPolyUpsampler.reset();
+    mOversamplingContainer.reset();
     mActivePolyphaseN = 1;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
@@ -742,7 +742,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     _StopPhaseWorkers();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
-    mPolyUpsampler.reset();
+    mOversamplingContainer.reset();
     mActivePolyphaseN = 1;
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
@@ -767,7 +767,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     // any heap allocation during ProcessBlock.
     const int blockSize = GetBlockSize();
     const double Fs = GetSampleRate();
-    mPolyUpBuf.assign((size_t)(N * blockSize), 0.0);
     mPhaseInputBufs.resize(N);
     mPhaseOutputBufs.resize(N);
     mPhaseInputPtrs.resize(N);
@@ -780,11 +779,13 @@ void NeuralAmpModeler::_ApplyDSPStaging()
       mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
     }
 
-    // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
-    mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
-      (float)Fs, (float)(N * Fs));
-    // Init causal polyphase synthesis filter for alias-free reconstruction.
-    _InitPolyphaseFilter(N);
+    // Init oversampling: Fs→N×Fs (upsample) → NAM → N×Fs→Fs (downsample).
+    // Both resamplers use Lanczos A=kOversamplingA; latency auto-computed via GetLatency().
+    mOversamplingContainer = std::make_unique<
+      dsp::ResamplingContainer<NAM_SAMPLE, 1, kOversamplingA>>(N * Fs);
+    mOversamplingContainer->Reset(Fs, blockSize);
+    mHighRateInBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
+    mHighRateOutBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
 
     // Start N-1 sleeping worker threads (phases 1..N-1).
     // Phase 0 always runs on the audio thread.
@@ -848,12 +849,12 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
   for (auto& pm : mRawPhaseModels)
     if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
-  if (mPolyUpsampler && !mRawPhaseModels.empty())
+  if (mOversamplingContainer && !mRawPhaseModels.empty())
   {
     const int N = mActivePolyphaseN;
-    mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
-      (float)sampleRate, (float)(N * sampleRate));
-    mPolyUpBuf.clear();
+    mOversamplingContainer->Reset(sampleRate, maxBlockSize);
+    mHighRateInBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
+    mHighRateOutBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
   }
 
   // IR
@@ -1350,9 +1351,8 @@ void NeuralAmpModeler::_UpdateLatency()
     latency += mModel->GetLatency();
   else if (!mRawPhaseModels.empty())
   {
-    // Shared Lanczos upsampler group delay ≈ kPolyphaseA samples at Fs.
-    // No output ring buffer in the new architecture.
-    latency += 2 * kPolyphaseA;
+    if (mOversamplingContainer)
+      latency += mOversamplingContainer->GetLatency();
   }
 
   // VST3 requires SetLatency to be called from the UI thread.
@@ -1456,107 +1456,71 @@ void NeuralAmpModeler::_StopPhaseWorkers()
   mPhaseWorkers.clear();
 }
 
-void NeuralAmpModeler::_InitPolyphaseFilter(int N)
-{
-  const int taps = 2 * kPolyphaseA + 1;
-  mPolySynthCoeffs.assign(N, std::vector<double>(taps, 0.0));
-  mPolySynthHistory.assign(N, std::vector<double>(taps, 0.0));
-  mPolySynthHistPos.assign(N, 0);
-
-  for (int p = 0; p < N; p++)
-    for (int j = 0; j < taps; j++)
-    {
-      // Causal Lanczos synthesis coefficient for phase p, tap j.
-      // Phase p carries N×Fs sample at sub-index p, i.e. time offset +p/N in Fs units.
-      // LP downsampling coeff: L_A((j-A) - p/N)/N — note subtraction of p/N.
-      const double x = (j - kPolyphaseA) - static_cast<double>(p) / N;
-      double coeff;
-      if (std::abs(x) < 1e-7)
-        coeff = 1.0 / N;
-      else if (std::abs(x) >= kPolyphaseA)
-        coeff = 0.0;
-      else
-        coeff = (std::sin(M_PI * x) / (M_PI * x))
-              * (std::sin(M_PI * x / kPolyphaseA) / (M_PI * x / kPolyphaseA))
-              / N;
-      mPolySynthCoeffs[p][j] = coeff;
-    }
-}
-
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = mActivePolyphaseN;
   _EnsurePhaseBuffers(N, nFrames);
 
-  // 1. Upsample Fs → N×Fs.
-  const int upLen = N * nFrames;
-  if ((int)mPolyUpBuf.size() < upLen)
-    mPolyUpBuf.assign(upLen, 0.0);
-  mPolyUpsampler->PushBlock(input, (size_t)nFrames);
-  {
-    double* ptr = mPolyUpBuf.data();
-    const size_t popped = mPolyUpsampler->PopBlock(&ptr, (size_t)upLen);
-    if ((int)popped < upLen)
-      std::fill(mPolyUpBuf.begin() + popped, mPolyUpBuf.begin() + upLen, 0.0);
-  }
-
-  // 2. Stride demux: phase p gets samples at indices p, N+p, 2N+p, ...
-  for (int p = 0; p < N; p++)
-    for (int i = 0; i < nFrames; i++)
-      mPhaseInputBufs[p][i] = static_cast<NAM_SAMPLE>(mPolyUpBuf[i * N + p]);
-
-  // 3. Process N independent phases in parallel.
-  //    Phase 0 runs on the audio thread; phases 1..N-1 run on sleeping worker threads.
-  if (mPhaseWorkers.empty())
-  {
-    // Serial fallback (N=1 or workers not yet started).
-    for (int p = 0; p < N; p++)
-      mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], nFrames);
-  }
-  else
-  {
-    // Dispatch phases 1..N-1 to background workers.
-    for (int p = 1; p < N; p++)
-    {
-      auto& w = *mPhaseWorkers[p - 1];
-      {
-        std::lock_guard<std::mutex> lk(w.workMtx);
-        w.input = &mPhaseInputPtrs[p];
-        w.output = &mPhaseOutputPtrs[p];
-        w.numFrames = nFrames;
-        w.model = mRawPhaseModels[p].get();
-        w.done.store(false, std::memory_order_relaxed);
-        w.workReady = true;
-      }
-      w.workCV.notify_one();
-    }
-    // Phase 0 on the audio thread.
-    mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], nFrames);
-    // Wait for all workers.
-    for (int p = 1; p < N; p++)
-    {
-      auto& w = *mPhaseWorkers[p - 1];
-      std::unique_lock<std::mutex> lk(w.workMtx);
-      w.doneCV.wait(lk, [&w] { return w.done.load(std::memory_order_acquire); });
-    }
-  }
-
-  // 4. Polyphase synthesis: causal Lanczos filter per phase, summed to Fs output.
-  //    Delay = kPolyphaseA samples at Fs; combined with upsampler: 2×kPolyphaseA total.
-  const int taps = 2 * kPolyphaseA + 1;
+  // Convert iplug::sample input → NAM_SAMPLE for ResamplingContainer.
+  thread_local std::vector<NAM_SAMPLE> inBuf, outBuf;
+  inBuf.resize(nFrames);
+  outBuf.resize(nFrames);
   for (int i = 0; i < nFrames; i++)
-  {
-    double sum = 0.0;
-    for (int p = 0; p < N; p++)
+    inBuf[i] = static_cast<NAM_SAMPLE>(input[0][i]);
+
+  NAM_SAMPLE* inPtr  = inBuf.data();
+  NAM_SAMPLE* outPtr = outBuf.data();
+
+  // ResamplingContainer: Fs→N×Fs (upsample) → callback → N×Fs→Fs (downsample).
+  mOversamplingContainer->ProcessBlock(&inPtr, &outPtr, nFrames,
+    [&](NAM_SAMPLE** hiIn, NAM_SAMPLE** hiOut, int hiFrames)
     {
-      const int hp = mPolySynthHistPos[p];
-      mPolySynthHistory[p][hp] = static_cast<double>(mPhaseOutputBufs[p][i]);
-      for (int j = 0; j < taps; j++)
-        sum += mPolySynthCoeffs[p][j] * mPolySynthHistory[p][(hp - j + taps) % taps];
-      mPolySynthHistPos[p] = (hp + 1) % taps;
-    }
-    output[0][i] = static_cast<iplug::sample>(sum);
-  }
+      const int phaseFrames = hiFrames / N;
+
+      // Stride demux: phase p ← hiIn[0][i*N + p]
+      for (int p = 0; p < N; p++)
+        for (int i = 0; i < phaseFrames; i++)
+          mPhaseInputBufs[p][i] = hiIn[0][i * N + p];
+
+      // Process N phases in parallel.
+      if (mPhaseWorkers.empty())
+      {
+        for (int p = 0; p < N; p++)
+          mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], phaseFrames);
+      }
+      else
+      {
+        for (int p = 1; p < N; p++)
+        {
+          auto& w = *mPhaseWorkers[p - 1];
+          {
+            std::lock_guard<std::mutex> lk(w.workMtx);
+            w.input = &mPhaseInputPtrs[p];
+            w.output = &mPhaseOutputPtrs[p];
+            w.numFrames = phaseFrames;
+            w.model = mRawPhaseModels[p].get();
+            w.done.store(false, std::memory_order_relaxed);
+            w.workReady = true;
+          }
+          w.workCV.notify_one();
+        }
+        mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], phaseFrames);
+        for (int p = 1; p < N; p++)
+        {
+          auto& w = *mPhaseWorkers[p - 1];
+          std::unique_lock<std::mutex> lk(w.workMtx);
+          w.doneCV.wait(lk, [&w] { return w.done.load(std::memory_order_acquire); });
+        }
+      }
+
+      // Mux phase outputs → high-rate interleaved output.
+      for (int p = 0; p < N; p++)
+        for (int i = 0; i < phaseFrames; i++)
+          hiOut[0][i * N + p] = mPhaseOutputBufs[p][i];
+    });
+
+  for (int i = 0; i < nFrames; i++)
+    output[0][i] = static_cast<iplug::sample>(outBuf[i]);
 }
 
 // HACK
