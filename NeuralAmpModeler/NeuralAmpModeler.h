@@ -1,9 +1,18 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <thread>
+
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__APPLE__) || defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
@@ -231,6 +240,67 @@ private:
   std::function<void(NAM_SAMPLE**, NAM_SAMPLE**, int)> mBlockProcessFunc;
 };
 
+// Minimum-phase Butterworth low-pass (biquad cascade, Direct Form II).
+// Used as anti-alias downsampler after polyphase mux.
+class ButterworthIIR
+{
+public:
+  // cutoffNorm = fc / fs, range (0, 0.5)
+  void Design(int order, double cutoffNorm)
+  {
+    const int nSections = order / 2;
+    mSections.resize(static_cast<size_t>(nSections));
+    mState.assign(static_cast<size_t>(nSections * 2), 0.0);
+
+    const double wd  = std::tan(M_PI * cutoffNorm);
+    const double wd2 = wd * wd;
+
+    for (int k = 0; k < nSections; k++)
+    {
+      const double theta = M_PI * (2.0 * k + 1.0 + order) / (2.0 * order);
+      const double Q     = -2.0 * std::cos(theta);
+      const double denom = 1.0 + Q * wd + wd2;
+      auto& s = mSections[static_cast<size_t>(k)];
+      s.b0 = wd2 / denom;
+      s.b1 = 2.0 * wd2 / denom;
+      s.b2 = wd2 / denom;
+      s.a1 = (2.0 * (wd2 - 1.0)) / denom;
+      s.a2 = (1.0 - Q * wd + wd2) / denom;
+    }
+  }
+
+  void ProcessBlock(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int n)
+  {
+    if (mSections.empty()) return;
+    if (src != dst)
+      std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(NAM_SAMPLE));
+
+    const int ns = static_cast<int>(mSections.size());
+    for (int k = 0; k < ns; k++)
+    {
+      auto& s  = mSections[static_cast<size_t>(k)];
+      double w1 = mState[static_cast<size_t>(k * 2)];
+      double w2 = mState[static_cast<size_t>(k * 2 + 1)];
+      for (int i = 0; i < n; i++)
+      {
+        const double x  = static_cast<double>(dst[i]);
+        const double w0 = x - s.a1 * w1 - s.a2 * w2;
+        dst[i] = static_cast<NAM_SAMPLE>(s.b0 * w0 + s.b1 * w1 + s.b2 * w2);
+        w2 = w1; w1 = w0;
+      }
+      mState[static_cast<size_t>(k * 2)]     = w1;
+      mState[static_cast<size_t>(k * 2 + 1)] = w2;
+    }
+  }
+
+  void Reset() { std::fill(mState.begin(), mState.end(), 0.0); }
+
+private:
+  struct Biquad { double b0, b1, b2, a1, a2; };
+  std::vector<Biquad> mSections;
+  std::vector<double> mState;
+};
+
 class NeuralAmpModeler final : public iplug::Plugin
 {
 public:
@@ -364,6 +434,13 @@ private:
   private:
     void _WorkerLoop(int idx)
     {
+#if defined(_WIN32)
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#elif defined(__APPLE__) || defined(__linux__)
+      struct sched_param sp;
+      sp.sched_priority = 1;
+      pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+#endif
       int seenGen = 0;
       for (;;)
       {
@@ -529,6 +606,7 @@ private:
   // Latency ≈ kOversamplingA samples at Fs; reported automatically via GetLatency().
   static constexpr int kOversamplingA = 32;
   std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, kOversamplingA>> mOversamplingContainer;
+  ButterworthIIR mAntiAliasFilter;
   std::vector<NAM_SAMPLE> mHighRateInBuf;   // scratch for high-rate input (inside callback)
   std::vector<NAM_SAMPLE> mHighRateOutBuf;  // scratch for high-rate output (inside callback)
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path

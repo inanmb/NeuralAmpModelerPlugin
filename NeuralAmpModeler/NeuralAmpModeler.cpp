@@ -786,6 +786,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mOversamplingContainer->Reset(Fs, blockSize);
     mHighRateInBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
     mHighRateOutBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
+    mAntiAliasFilter.Design(8, 0.5 / N);
+    mAntiAliasFilter.Reset();
 
     // Acquire/create the shared thread pool (one pool per thread count, reused across blocks).
     mPhasePool = _GetPhasePool((int)std::thread::hardware_concurrency());
@@ -853,6 +855,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     mOversamplingContainer->Reset(sampleRate, maxBlockSize);
     mHighRateInBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
     mHighRateOutBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
+    mAntiAliasFilter.Reset();
   }
 
   // IR
@@ -1450,6 +1453,9 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
         for (int i = 0; i < pf; i++)
           hiOut[0][p + i * N] = mPhaseOutputBufs[p][i];
       }
+
+      // Minimum-phase anti-alias filter before ResamplingContainer decimates.
+      mAntiAliasFilter.ProcessBlock(hiOut[0], hiOut[0], hiFrames);
     });
 
   for (int i = 0; i < nFrames; i++)
