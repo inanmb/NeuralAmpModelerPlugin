@@ -232,66 +232,65 @@ private:
   std::function<void(NAM_SAMPLE**, NAM_SAMPLE**, int)> mBlockProcessFunc;
 };
 
-// Minimum-phase Butterworth low-pass (biquad cascade, Direct Form II).
-// Used as anti-alias downsampler after polyphase mux.
-class ButterworthIIR
+// 2x IIR half-band polyphase filter (Vaidyanathan structure, 6 first-order allpass
+// sections per branch). Coefficients extracted from reference binary.
+// Allpass: H(z) = (c + z^-1) / (1 + c*z^-1),  y[n] = c*(x[n]-y[n-1]) + x[n-1]
+class HalfBandFilter
 {
 public:
-  // cutoffNorm = fc / fs, range (0, 0.5)
-  void Design(int order, double cutoffNorm)
+  // 1 input sample → 2 interleaved output samples (even from branch B, odd from branch A)
+  void Upsample2x(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int numIn)
   {
-    constexpr double kPi = 3.14159265358979323846;
-    const int nSections = order / 2;
-    mSections.resize(static_cast<size_t>(nSections));
-    mState.assign(static_cast<size_t>(nSections * 2), 0.0);
-
-    const double wd  = std::tan(kPi * cutoffNorm);
-    const double wd2 = wd * wd;
-
-    for (int k = 0; k < nSections; k++)
+    for (int n = 0; n < numIn; n++)
     {
-      const double theta = kPi * (2.0 * k + 1.0 + order) / (2.0 * order);
-      const double Q     = -2.0 * std::cos(theta);
-      const double denom = 1.0 + Q * wd + wd2;
-      auto& s = mSections[static_cast<size_t>(k)];
-      s.b0 = wd2 / denom;
-      s.b1 = 2.0 * wd2 / denom;
-      s.b2 = wd2 / denom;
-      s.a1 = (2.0 * (wd2 - 1.0)) / denom;
-      s.a2 = (1.0 - Q * wd + wd2) / denom;
+      const double x = static_cast<double>(src[n]);
+      dst[2 * n]     = static_cast<NAM_SAMPLE>(RunBranch(x, kCoeffB, sB));
+      dst[2 * n + 1] = static_cast<NAM_SAMPLE>(RunBranch(x, kCoeffA, sA));
     }
   }
 
-  void ProcessBlock(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int n)
+  // 2 interleaved input samples → 1 output sample
+  void Downsample2x(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int numOut)
   {
-    if (mSections.empty()) return;
-    if (src != dst)
-      std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(NAM_SAMPLE));
-
-    const int ns = static_cast<int>(mSections.size());
-    for (int k = 0; k < ns; k++)
+    for (int n = 0; n < numOut; n++)
     {
-      auto& s  = mSections[static_cast<size_t>(k)];
-      double w1 = mState[static_cast<size_t>(k * 2)];
-      double w2 = mState[static_cast<size_t>(k * 2 + 1)];
-      for (int i = 0; i < n; i++)
-      {
-        const double x  = static_cast<double>(dst[i]);
-        const double w0 = x - s.a1 * w1 - s.a2 * w2;
-        dst[i] = static_cast<NAM_SAMPLE>(s.b0 * w0 + s.b1 * w1 + s.b2 * w2);
-        w2 = w1; w1 = w0;
-      }
-      mState[static_cast<size_t>(k * 2)]     = w1;
-      mState[static_cast<size_t>(k * 2 + 1)] = w2;
+      const double ya = RunBranch(static_cast<double>(src[2 * n]),     kCoeffA, sA);
+      const double yb = RunBranch(static_cast<double>(src[2 * n + 1]), kCoeffB, sB);
+      dst[n] = static_cast<NAM_SAMPLE>((ya + yb) * 0.5);
     }
   }
 
-  void Reset() { std::fill(mState.begin(), mState.end(), 0.0); }
+  void Reset()
+  {
+    for (int k = 0; k < kSections; k++)
+      sA[k][0] = sA[k][1] = sB[k][0] = sB[k][1] = 0.0;
+  }
 
 private:
-  struct Biquad { double b0, b1, b2, a1, a2; };
-  std::vector<Biquad> mSections;
-  std::vector<double> mState;
+  static constexpr int kSections = 6;
+  // Branch A: downsampler even / upsampler odd
+  static constexpr double kCoeffA[kSections] = {
+    0.136548, 0.423139, 0.677540, 0.839890, 0.931542, 0.987816
+  };
+  // Branch B: downsampler odd / upsampler even
+  static constexpr double kCoeffB[kSections] = {
+    0.036682, 0.274632, 0.561099, 0.769742, 0.892261, 0.962095
+  };
+
+  double sA[kSections][2]{};  // [section][prevIn, prevOut]
+  double sB[kSections][2]{};
+
+  static double RunBranch(double x, const double* c, double s[][2])
+  {
+    for (int k = 0; k < kSections; k++)
+    {
+      const double y = c[k] * (x - s[k][1]) + s[k][0];
+      s[k][0] = x;
+      s[k][1] = y;
+      x = y;
+    }
+    return x;
+  }
 };
 
 class NeuralAmpModeler final : public iplug::Plugin
@@ -370,9 +369,8 @@ private:
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
 
-  // Polyphase (oversampling) helpers
-  void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
-  void _EnsurePhaseBuffers(int N, int framesPerPhase);
+  // IIR cascade oversampling (DLC architecture: single model at N×Fs)
+  void _ProcessIIROversample(iplug::sample** input, iplug::sample** output, int nFrames);
 
   // Thread pool for parallel phase processing.
   // One persistent pool per thread count; audio thread always handles job 0.
@@ -470,8 +468,6 @@ private:
     if (!pools[n]) pools[n] = std::make_shared<PhaseMulticorePool>(n);
     return pools[n];
   }
-
-  std::shared_ptr<PhaseMulticorePool> mPhasePool;
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -586,18 +582,12 @@ private:
   int mActivePolyphaseN = 1;
   int mStagedPolyphaseN = 1;
 
-  // Per-phase scratch buffers (NAM_SAMPLE, one channel each).
-  std::vector<std::vector<NAM_SAMPLE>> mPhaseInputBufs;
-  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutputBufs;
-  std::vector<NAM_SAMPLE*> mPhaseInputPtrs;
-  std::vector<NAM_SAMPLE*> mPhaseOutputPtrs;
-
-  // Oversampling via two back-to-back Lanczos resamplers (Fs→N×Fs→Fs).
-  // Latency ≈ kOversamplingA samples at Fs; reported automatically via GetLatency().
-  static constexpr int kOversamplingA = 32;
-  std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, kOversamplingA>> mOversamplingContainer;
-  ButterworthIIR mAntiAliasFilter;
-  std::vector<NAM_SAMPLE> mHighRateInBuf;   // scratch for high-rate input (inside callback)
-  std::vector<NAM_SAMPLE> mHighRateOutBuf;  // scratch for high-rate output (inside callback)
+  // IIR half-band cascade up/downsamplers (one stage = 2x).
+  // nStages = log2(N); all stages use identical HalfBandFilter design.
+  std::vector<HalfBandFilter> mUpStages;
+  std::vector<HalfBandFilter> mDownStages;
+  // Ping-pong scratch buffers at high rate (size = N * maxBlockSize).
+  std::vector<NAM_SAMPLE> mHiBufA;
+  std::vector<NAM_SAMPLE> mHiBufB;
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
 };
