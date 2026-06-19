@@ -692,6 +692,8 @@ private:
 
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;
+  // Thread-safe snapshot of kIRToggle, read by the slot worker thread.
+  std::atomic<bool> mIRToggleAtomic{true};
 
   // Fade-in/fade-out when switching models (audio thread only)
   bool mTransitionFadingOut = false;
