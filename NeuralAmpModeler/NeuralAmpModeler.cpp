@@ -338,7 +338,8 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
-  mPhasePool.reset(); // release shared pool reference (pool itself is static, threads kept alive)
+  mUpStages.clear();
+  mDownStages.clear();
   {
     std::lock_guard<std::mutex> lock(mSlotWorkerMutex);
     mSlotWorkerStop = true;
@@ -387,7 +388,7 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
 
   if (!mRawPhaseModels.empty())
   {
-    _ProcessPolyphase(triggerOutput, mOutputPointers, nFrames);
+    _ProcessIIROversample(triggerOutput, mOutputPointers, nFrames);
   }
   else if (mModel != nullptr)
   {
@@ -717,11 +718,11 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Remove marked modules
   if (mShouldRemoveModel)
   {
-    mPhasePool.reset();
     mModel = nullptr;
     mPhaseModels.clear();
     mRawPhaseModels.clear();
-    mOversamplingContainer.reset();
+    mUpStages.clear();
+    mDownStages.clear();
     mActivePolyphaseN = 1;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
@@ -739,10 +740,10 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
-    mPhasePool.reset();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
-    mOversamplingContainer.reset();
+    mUpStages.clear();
+    mDownStages.clear();
     mActivePolyphaseN = 1;
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
@@ -763,34 +764,17 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mStagedPhaseModels.clear();
     mStagedRawPhaseModels.clear();
 
-    // Pre-allocate upsampler buffer and phase scratch buffers now to eliminate
-    // any heap allocation during ProcessBlock.
+    // IIR half-band cascade: log2(N) stages of 2x up/downsamplers.
+    // For non-power-of-2 N, round to nearest power of 2 (e.g. 3x → 4x).
     const int blockSize = GetBlockSize();
-    const double Fs = GetSampleRate();
-    mPhaseInputBufs.resize(N);
-    mPhaseOutputBufs.resize(N);
-    mPhaseInputPtrs.resize(N);
-    mPhaseOutputPtrs.resize(N);
-    for (int p = 0; p < N; p++)
-    {
-      mPhaseInputBufs[p].assign((size_t)blockSize, 0.0f);
-      mPhaseOutputBufs[p].assign((size_t)blockSize, 0.0f);
-      mPhaseInputPtrs[p] = mPhaseInputBufs[p].data();
-      mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
-    }
-
-    // Init oversampling: Fs→N×Fs (upsample) → NAM → N×Fs→Fs (downsample).
-    // Both resamplers use Lanczos A=kOversamplingA; latency auto-computed via GetLatency().
-    mOversamplingContainer = std::make_unique<
-      dsp::ResamplingContainer<NAM_SAMPLE, 1, kOversamplingA>>(N * Fs);
-    mOversamplingContainer->Reset(Fs, blockSize);
-    mHighRateInBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
-    mHighRateOutBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
-    mAntiAliasFilter.Design(8, 0.5 / N);
-    mAntiAliasFilter.Reset();
-
-    // Acquire/create the shared thread pool (one pool per thread count, reused across blocks).
-    mPhasePool = _GetPhasePool((int)std::thread::hardware_concurrency());
+    const int nStages = std::max(1, (int)std::round(std::log2(static_cast<double>(N))));
+    mUpStages.assign(static_cast<size_t>(nStages), HalfBandFilter{});
+    mDownStages.assign(static_cast<size_t>(nStages), HalfBandFilter{});
+    mHiBufA.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
+    mHiBufB.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
+    // Prepare single raw model for N×Fs operation (only [0] is used in IIR path).
+    if (!mRawPhaseModels.empty() && mRawPhaseModels[0])
+      mRawPhaseModels[0]->ResetAndPrewarm(GetSampleRate(), N * blockSize);
 
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
@@ -845,17 +829,16 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (pm) pm->Reset(sampleRate, maxBlockSize);
   for (auto& pm : mPhaseModels)
     if (pm) pm->Reset(sampleRate, maxBlockSize);
-  for (auto& pm : mStagedRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
-  for (auto& pm : mRawPhaseModels)
-    if (pm) pm->ResetAndPrewarm(sampleRate, maxBlockSize);
-  if (mOversamplingContainer && !mRawPhaseModels.empty())
+  if (!mStagedRawPhaseModels.empty() && mStagedRawPhaseModels[0])
+    mStagedRawPhaseModels[0]->ResetAndPrewarm(sampleRate, mStagedPolyphaseN * maxBlockSize);
+  if (!mRawPhaseModels.empty() && mRawPhaseModels[0] && !mUpStages.empty())
   {
     const int N = mActivePolyphaseN;
-    mOversamplingContainer->Reset(sampleRate, maxBlockSize);
-    mHighRateInBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
-    mHighRateOutBuf.assign((size_t)(N * maxBlockSize), NAM_SAMPLE(0));
-    mAntiAliasFilter.Reset();
+    mRawPhaseModels[0]->ResetAndPrewarm(sampleRate, N * maxBlockSize);
+    for (auto& s : mUpStages)   s.Reset();
+    for (auto& s : mDownStages) s.Reset();
+    mHiBufA.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
+    mHiBufB.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
   }
 
   // IR
@@ -1350,11 +1333,7 @@ void NeuralAmpModeler::_UpdateLatency()
   int latency = 0;
   if (mModel)
     latency += mModel->GetLatency();
-  else if (!mRawPhaseModels.empty())
-  {
-    if (mOversamplingContainer)
-      latency += mOversamplingContainer->GetLatency();
-  }
+  // IIR half-band cascade is minimum phase: group delay ≈ 0, no latency to report.
 
   // VST3 requires SetLatency to be called from the UI thread.
   // Store the pending value here (audio thread); OnIdle applies it on the UI thread.
@@ -1372,94 +1351,45 @@ void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPoint
 }
 
 
-void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
+
+void NeuralAmpModeler::_ProcessIIROversample(iplug::sample** input, iplug::sample** output, int nFrames)
 {
-  if ((int)mPhaseInputBufs.size() != N)
-  {
-    mPhaseInputBufs.resize(N);
-    mPhaseOutputBufs.resize(N);
-    mPhaseInputPtrs.resize(N);
-    mPhaseOutputPtrs.resize(N);
-  }
-  for (int p = 0; p < N; p++)
-  {
-    if ((int)mPhaseInputBufs[p].size() < framesPerPhase)
-      mPhaseInputBufs[p].resize(framesPerPhase, 0.0f);
-    if ((int)mPhaseOutputBufs[p].size() < framesPerPhase)
-      mPhaseOutputBufs[p].resize(framesPerPhase, 0.0f);
-    mPhaseInputPtrs[p] = mPhaseInputBufs[p].data();
-    mPhaseOutputPtrs[p] = mPhaseOutputBufs[p].data();
-  }
-}
+  const int nStages = static_cast<int>(mUpStages.size());
 
-
-void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
-{
-  const int N = mActivePolyphaseN;
-
-  // Convert iplug::sample input → NAM_SAMPLE for ResamplingContainer.
-  thread_local std::vector<NAM_SAMPLE> inBuf, outBuf;
-  inBuf.resize(nFrames);
-  outBuf.resize(nFrames);
+  // Convert iplug::sample → NAM_SAMPLE, write into mHiBufA (first nFrames entries).
   for (int i = 0; i < nFrames; i++)
-    inBuf[i] = static_cast<NAM_SAMPLE>(input[0][i]);
+    mHiBufA[static_cast<size_t>(i)] = static_cast<NAM_SAMPLE>(input[0][i]);
 
-  NAM_SAMPLE* inPtr  = inBuf.data();
-  NAM_SAMPLE* outPtr = outBuf.data();
+  // Cascade upsample: ping-pong between mHiBufA and mHiBufB.
+  NAM_SAMPLE* cur  = mHiBufA.data();
+  NAM_SAMPLE* alt  = mHiBufB.data();
+  int curN = nFrames;
+  for (int s = 0; s < nStages; s++)
+  {
+    mUpStages[static_cast<size_t>(s)].Upsample2x(cur, alt, curN);
+    curN *= 2;
+    std::swap(cur, alt);
+  }
+  // cur → upsampled high-rate signal (curN = N * nFrames), alt → scratch
 
-  // ResamplingContainer: Fs→N×Fs (upsample) → polyphase NAM → N×Fs→Fs (downsample).
-  // N models run in parallel at Fs; each processes every N-th high-rate sample.
-  mOversamplingContainer->ProcessBlock(&inPtr, &outPtr, nFrames,
-    [&](NAM_SAMPLE** hiIn, NAM_SAMPLE** hiOut, int hiFrames)
-    {
-      const int maxPhaseFrames = (hiFrames + N - 1) / N;
-      _EnsurePhaseBuffers(N, maxPhaseFrames);
+  // Single NAM model processes the full high-rate block.
+  NAM_SAMPLE* hiIn  = cur;
+  NAM_SAMPLE* hiOut = alt;
+  mRawPhaseModels[0]->process(&hiIn, &hiOut, curN);
 
-      // Stride demux: phase p reads hiIn[0][p + i*N]
-      for (int p = 0; p < N; p++)
-      {
-        const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
-        for (int i = 0; i < pf; i++)
-          mPhaseInputBufs[p][i] = hiIn[0][p + i * N];
-      }
-
-      // Process N phases via thread pool.
-      // Each job handles phasesPerJob consecutive phases to amortize synchronization cost.
-      const int availThreads = mPhasePool ? mPhasePool->ThreadCount() : 1;
-      const int jobCount = std::max(1, std::min(availThreads, N));
-      const int phasesPerJob = (N + jobCount - 1) / jobCount;
-
-      auto processPhases = [&](int jobIdx)
-      {
-        const int phaseBegin = jobIdx * phasesPerJob;
-        const int phaseEnd = std::min(N, phaseBegin + phasesPerJob);
-        for (int p = phaseBegin; p < phaseEnd; p++)
-        {
-          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
-          if (pf > 0)
-            mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], pf);
-        }
-      };
-
-      if (mPhasePool)
-        mPhasePool->ParallelFor(jobCount, processPhases);
-      else
-        processPhases(0);
-
-      // Mux phase outputs → high-rate interleaved output.
-      for (int p = 0; p < N; p++)
-      {
-        const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
-        for (int i = 0; i < pf; i++)
-          hiOut[0][p + i * N] = mPhaseOutputBufs[p][i];
-      }
-
-      // Minimum-phase anti-alias filter before ResamplingContainer decimates.
-      mAntiAliasFilter.ProcessBlock(hiOut[0], hiOut[0], hiFrames);
-    });
+  // Cascade downsample (reverse stage order, same filters).
+  cur = hiOut;
+  alt = hiIn;
+  for (int s = nStages - 1; s >= 0; s--)
+  {
+    curN /= 2;
+    mDownStages[static_cast<size_t>(s)].Downsample2x(cur, alt, curN);
+    std::swap(cur, alt);
+  }
+  // cur → output at base rate (curN = nFrames)
 
   for (int i = 0; i < nFrames; i++)
-    output[0][i] = static_cast<iplug::sample>(outBuf[i]);
+    output[0][i] = static_cast<iplug::sample>(cur[i]);
 }
 
 // HACK
