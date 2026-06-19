@@ -876,9 +876,13 @@ void NeuralAmpModeler::_SetOutputGain()
 void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
 {
   const double v = GetParam(kSlim)->Value();
-  auto apply = [v](ResamplingNAM* p) {
-    if (p && p->GetSlimmableModel())
-      p->GetSlimmableModel()->SetSlimmableSize(v);
+  auto apply = [v](nam::DSP* p) {
+    if (!p) return;
+    nam::DSP* target = p;
+    if (auto* r = dynamic_cast<ResamplingNAM*>(p))
+      if (auto* s = r->GetSlimmableModel()) target = s;
+    if (auto* slimmable = dynamic_cast<nam::SlimmableModel*>(target))
+      slimmable->SetSlimmableSize(v);
   };
   apply(mModel.get());
   apply(mStagedModel.get());
@@ -1032,16 +1036,27 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       throw std::runtime_error("Model must have 1 output channel, but has "
                                + std::to_string(raw->NumOutputChannels()));
 
-    auto wrapped = std::make_unique<ResamplingNAM>(std::move(raw), GetSampleRate(), dspPath);
-    wrapped->SetOversamplingFactor(N);
-    wrapped->SetAntiAliasFilterPhase(dsp::EAntiAliasFilterPhase::MinimumPhaseCascadedFIR);
-    const bool multicoreEnabled = GetParam(kMulticoreEnabled)->Bool();
-    wrapped->SetPhaseMulticoreThreadCount(multicoreEnabled ? NAMPhaseMulticoreHardwareThreads() : 1);
-    wrapped->Reset(GetSampleRate(), GetBlockSize());
-    if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
-      slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
-
-    mStagedModel = std::move(wrapped);
+    std::unique_ptr<nam::DSP> model;
+    if (N > 1)
+    {
+      auto wrapped = std::make_unique<ResamplingNAM>(std::move(raw), GetSampleRate(), dspPath);
+      wrapped->SetOversamplingFactor(N);
+      wrapped->SetAntiAliasFilterPhase(dsp::EAntiAliasFilterPhase::MinimumPhaseCascadedFIR);
+      const bool multicoreEnabled = GetParam(kMulticoreEnabled)->Bool();
+      wrapped->SetPhaseMulticoreThreadCount(multicoreEnabled ? NAMPhaseMulticoreHardwareThreads() : 1);
+      wrapped->Reset(GetSampleRate(), GetBlockSize());
+      if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
+        slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+      model = std::move(wrapped);
+    }
+    else
+    {
+      raw->Reset(GetSampleRate(), GetBlockSize());
+      if (auto* slimmable = dynamic_cast<nam::SlimmableModel*>(raw.get()))
+        slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+      model = std::move(raw);
+    }
+    mStagedModel = std::move(model);
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
   }
@@ -1208,14 +1223,15 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 
 void NeuralAmpModeler::_UpdateControlsFromModel()
 {
-  ResamplingNAM* activeModel = mModel.get();
+  nam::DSP* activeModel = mModel.get();
   if (activeModel == nullptr)
     return;
   if (auto* pGraphics = GetUI())
   {
     ModelInfo modelInfo;
     modelInfo.sampleRate.known = true;
-    modelInfo.sampleRate.value = activeModel->GetEncapsulatedSampleRate();
+    auto* r = dynamic_cast<ResamplingNAM*>(activeModel);
+    modelInfo.sampleRate.value = r ? r->GetEncapsulatedSampleRate() : GetSampleRate();
     modelInfo.inputCalibrationLevel.known = activeModel->HasInputLevel();
     modelInfo.inputCalibrationLevel.value = activeModel->HasInputLevel() ? activeModel->GetInputLevel() : 0.0;
     modelInfo.outputCalibrationLevel.known = activeModel->HasOutputLevel();
@@ -1234,7 +1250,11 @@ void NeuralAmpModeler::_UpdateControlsFromModel()
 
     if (auto* pSlimIcon = pGraphics->GetControlWithTag(kCtrlTagSlimmableIcon))
     {
-      const bool show = activeModel->GetSlimmableModel() != nullptr;
+      bool show = false;
+      if (auto* rv = dynamic_cast<ResamplingNAM*>(activeModel))
+        show = rv->GetSlimmableModel() != nullptr;
+      else
+        show = dynamic_cast<nam::SlimmableModel*>(activeModel) != nullptr;
       pSlimIcon->Hide(!show);
     }
   }
@@ -1243,8 +1263,8 @@ void NeuralAmpModeler::_UpdateControlsFromModel()
 void NeuralAmpModeler::_UpdateLatency()
 {
   int latency = 0;
-  if (mModel)
-    latency += mModel->GetLatency();
+  if (auto* r = dynamic_cast<ResamplingNAM*>(mModel.get()))
+    latency += r->GetLatency();
   // IIR half-band cascade is minimum phase: group delay ≈ 0, no latency to report.
 
   // VST3 requires SetLatency to be called from the UI thread.

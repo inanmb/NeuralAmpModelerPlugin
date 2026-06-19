@@ -680,11 +680,11 @@ private:
   dsp::noise_gate::Trigger mNoiseGateTrigger;
   dsp::noise_gate::Gain mNoiseGateGain;
   // The model actually being used:
-  std::unique_ptr<ResamplingNAM> mModel;
+  std::unique_ptr<nam::DSP> mModel;
   // And the IR
   std::unique_ptr<dsp::ImpulseResponse> mIR;
   // Manages switching what DSP is being used.
-  std::unique_ptr<ResamplingNAM> mStagedModel;
+  std::unique_ptr<nam::DSP> mStagedModel;
   std::unique_ptr<dsp::ImpulseResponse> mStagedIR;
   // Flags to take away the modules at a safe time.
   std::atomic<bool> mShouldRemoveModel = false;
