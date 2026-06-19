@@ -1467,8 +1467,9 @@ void NeuralAmpModeler::_InitPolyphaseFilter(int N)
     for (int j = 0; j < taps; j++)
     {
       // Causal Lanczos synthesis coefficient for phase p, tap j.
-      // x = (j - A) + p/N places the prototype filter peak at j=A with phase offset p/N.
-      const double x = (j - kPolyphaseA) + static_cast<double>(p) / N;
+      // Phase p carries N×Fs sample at sub-index p, i.e. time offset +p/N in Fs units.
+      // LP downsampling coeff: L_A((j-A) - p/N)/N — note subtraction of p/N.
+      const double x = (j - kPolyphaseA) - static_cast<double>(p) / N;
       double coeff;
       if (std::abs(x) < 1e-7)
         coeff = 1.0 / N;
