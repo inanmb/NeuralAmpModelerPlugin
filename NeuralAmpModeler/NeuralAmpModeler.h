@@ -310,26 +310,101 @@ private:
   // Polyphase (oversampling) helpers
   void _ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames);
   void _EnsurePhaseBuffers(int N, int framesPerPhase);
-  void _StartPhaseWorkers(int numWorkers);
-  void _StopPhaseWorkers();
 
-  struct PhaseWorker
+  // Thread pool for parallel phase processing.
+  // One persistent pool per thread count; audio thread always handles job 0.
+  class PhaseMulticorePool
   {
-    std::thread thread;
-    int phaseIdx = 0;
-    NAM_SAMPLE** input = nullptr;
-    NAM_SAMPLE** output = nullptr;
-    int numFrames = 0;
-    nam::DSP* model = nullptr;
-    std::mutex workMtx;
-    std::condition_variable workCV;
-    bool workReady = false;
-    bool quit = false;
-    // atomic: written by worker, read by audio thread — avoids data race (no shared mutex needed).
-    std::atomic<bool> done{true};
-    std::condition_variable doneCV; // waited and notified under workMtx
+  public:
+    explicit PhaseMulticorePool(int totalThreads)
+    {
+      const int workerCount = std::max(0, totalThreads - 1);
+      mWorkers.reserve(static_cast<size_t>(workerCount));
+      for (int i = 0; i < workerCount; i++)
+      {
+        const int workerJobIndex = i + 1;
+        mWorkers.emplace_back([this, workerJobIndex] { _WorkerLoop(workerJobIndex); });
+      }
+    }
+
+    ~PhaseMulticorePool()
+    {
+      { std::lock_guard<std::mutex> lk(mMutex); mStop = true; ++mGeneration; }
+      mCV.notify_all();
+      for (auto& t : mWorkers)
+        if (t.joinable()) t.join();
+    }
+
+    int ThreadCount() const { return static_cast<int>(mWorkers.size()) + 1; }
+
+    template <typename Fn>
+    void ParallelFor(int jobCount, Fn&& fn)
+    {
+      if (jobCount <= 1 || mWorkers.empty()) { for (int j = 0; j < jobCount; j++) fn(j); return; }
+      const int clamped = std::max(1, std::min(jobCount, ThreadCount()));
+      const int workerJobs = std::max(0, clamped - 1);
+      {
+        std::lock_guard<std::mutex> lk(mMutex);
+        mJob = std::forward<Fn>(fn);
+        mJobCount = clamped;
+        mRemainingWorkers = workerJobs;
+        mDone = (workerJobs == 0);
+        ++mGeneration;
+      }
+      mCV.notify_all();
+      mJob(0); // audio thread handles job 0
+      if (workerJobs > 0)
+      {
+        std::unique_lock<std::mutex> lk(mMutex);
+        mDoneCV.wait(lk, [this] { return mDone; });
+      }
+      { std::lock_guard<std::mutex> lk(mMutex); mJob = nullptr; }
+    }
+
+  private:
+    void _WorkerLoop(int idx)
+    {
+      int seenGen = 0;
+      for (;;)
+      {
+        std::function<void(int)> job;
+        bool run = false;
+        {
+          std::unique_lock<std::mutex> lk(mMutex);
+          mCV.wait(lk, [this, &seenGen] { return mStop || mGeneration != seenGen; });
+          if (mStop) return;
+          seenGen = mGeneration;
+          run = idx < mJobCount && static_cast<bool>(mJob);
+          if (run) job = mJob;
+        }
+        if (run) job(idx);
+        {
+          std::lock_guard<std::mutex> lk(mMutex);
+          if (run && --mRemainingWorkers == 0 && !mDone) { mDone = true; mDoneCV.notify_one(); }
+        }
+      }
+    }
+
+    std::vector<std::thread> mWorkers;
+    std::mutex mMutex;
+    std::condition_variable mCV, mDoneCV;
+    std::function<void(int)> mJob;
+    int mJobCount = 0, mRemainingWorkers = 0, mGeneration = 0;
+    bool mDone = true, mStop = false;
   };
-  std::vector<std::unique_ptr<PhaseWorker>> mPhaseWorkers;
+
+  static std::shared_ptr<PhaseMulticorePool> _GetPhasePool(int totalThreads)
+  {
+    static std::mutex poolsMtx;
+    static std::vector<std::shared_ptr<PhaseMulticorePool>> pools;
+    const int n = std::max(1, std::min(totalThreads, (int)std::thread::hardware_concurrency()));
+    std::lock_guard<std::mutex> lk(poolsMtx);
+    if ((int)pools.size() <= n) pools.resize(static_cast<size_t>(n + 1));
+    if (!pools[n]) pools[n] = std::make_shared<PhaseMulticorePool>(n);
+    return pools[n];
+  }
+
+  std::shared_ptr<PhaseMulticorePool> mPhasePool;
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);

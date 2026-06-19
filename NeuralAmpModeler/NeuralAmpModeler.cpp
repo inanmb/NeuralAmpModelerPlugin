@@ -338,7 +338,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
-  _StopPhaseWorkers();
+  mPhasePool.reset(); // release shared pool reference (pool itself is static, threads kept alive)
   {
     std::lock_guard<std::mutex> lock(mSlotWorkerMutex);
     mSlotWorkerStop = true;
@@ -717,7 +717,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Remove marked modules
   if (mShouldRemoveModel)
   {
-    _StopPhaseWorkers();
+    mPhasePool.reset();
     mModel = nullptr;
     mPhaseModels.clear();
     mRawPhaseModels.clear();
@@ -739,7 +739,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
-    _StopPhaseWorkers();
+    mPhasePool.reset();
     mPhaseModels.clear();
     mRawPhaseModels.clear();
     mOversamplingContainer.reset();
@@ -787,9 +787,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mHighRateInBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
     mHighRateOutBuf.assign((size_t)(N * blockSize), NAM_SAMPLE(0));
 
-    // Start N-1 worker threads for phases 1..N-1 (phase 0 runs on the audio thread).
-    if (N > 1)
-      _StartPhaseWorkers(N - 1);
+    // Acquire/create the shared thread pool (one pool per thread count, reused across blocks).
+    mPhasePool = _GetPhasePool((int)std::thread::hardware_concurrency());
 
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
@@ -1390,70 +1389,6 @@ void NeuralAmpModeler::_EnsurePhaseBuffers(int N, int framesPerPhase)
   }
 }
 
-void NeuralAmpModeler::_StartPhaseWorkers(int numWorkers)
-{
-  _StopPhaseWorkers();
-  mPhaseWorkers.reserve(numWorkers);
-  for (int i = 0; i < numWorkers; i++)
-  {
-    auto w = std::make_unique<PhaseWorker>();
-    w->phaseIdx = i + 1;
-    w->thread = std::thread([pw = w.get()] {
-      // Flush-to-zero + denormals-are-zero for this worker thread (x86 only).
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-      _mm_setcsr(_mm_getcsr() | 0x8040);
-#endif
-      while (true)
-      {
-        nam::DSP* model = nullptr;
-        NAM_SAMPLE** in = nullptr;
-        NAM_SAMPLE** out = nullptr;
-        int nf = 0;
-        {
-          std::unique_lock<std::mutex> lk(pw->workMtx);
-          pw->workCV.wait(lk, [pw] { return pw->workReady || pw->quit; });
-          if (pw->quit)
-            break;
-          model = pw->model;
-          in = pw->input;
-          out = pw->output;
-          nf = pw->numFrames;
-          pw->workReady = false;
-        }
-        // Wrap in try/catch: if the model throws, the worker must still signal
-        // completion so the audio thread doesn't block indefinitely.
-        try
-        {
-          if (model && in && out)
-            model->process(in, out, nf);
-        }
-        catch (...) {}
-        // Release store so the audio thread's acquire load sees the completed work.
-        pw->done.store(true, std::memory_order_release);
-        // Acquire workMtx before notify to prevent the audio thread's wait from
-        // missing the notification if it hasn't called wait yet.
-        { std::lock_guard<std::mutex> lk(pw->workMtx); }
-        pw->doneCV.notify_one();
-      }
-    });
-    mPhaseWorkers.push_back(std::move(w));
-  }
-}
-
-void NeuralAmpModeler::_StopPhaseWorkers()
-{
-  for (auto& w : mPhaseWorkers)
-  {
-    {
-      std::lock_guard<std::mutex> lk(w->workMtx);
-      w->quit = true;
-    }
-    w->workCV.notify_one();
-    if (w->thread.joinable())
-      w->thread.join();
-  }
-  mPhaseWorkers.clear();
-}
 
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
@@ -1485,48 +1420,28 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
           mPhaseInputBufs[p][i] = hiIn[0][p + i * N];
       }
 
-      // Process N phases in parallel.
-      if (mPhaseWorkers.empty())
+      // Process N phases via thread pool.
+      // Each job handles phasesPerJob consecutive phases to amortize synchronization cost.
+      const int availThreads = mPhasePool ? mPhasePool->ThreadCount() : 1;
+      const int jobCount = std::max(1, std::min(availThreads, N));
+      const int phasesPerJob = (N + jobCount - 1) / jobCount;
+
+      auto processPhases = [&](int jobIdx)
       {
-        for (int p = 0; p < N; p++)
+        const int phaseBegin = jobIdx * phasesPerJob;
+        const int phaseEnd = std::min(N, phaseBegin + phasesPerJob);
+        for (int p = phaseBegin; p < phaseEnd; p++)
         {
           const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
           if (pf > 0)
             mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], pf);
         }
-      }
+      };
+
+      if (mPhasePool)
+        mPhasePool->ParallelFor(jobCount, processPhases);
       else
-      {
-        for (int p = 1; p < N; p++)
-        {
-          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
-          if (pf <= 0)
-            continue;
-          auto& w = *mPhaseWorkers[p - 1];
-          {
-            std::lock_guard<std::mutex> lk(w.workMtx);
-            w.input = &mPhaseInputPtrs[p];
-            w.output = &mPhaseOutputPtrs[p];
-            w.numFrames = pf;
-            w.model = mRawPhaseModels[p].get();
-            w.done.store(false, std::memory_order_relaxed);
-            w.workReady = true;
-          }
-          w.workCV.notify_one();
-        }
-        const int pf0 = hiFrames > 0 ? ((hiFrames + N - 1) / N) : 0;
-        if (pf0 > 0)
-          mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], pf0);
-        for (int p = 1; p < N; p++)
-        {
-          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
-          if (pf <= 0)
-            continue;
-          auto& w = *mPhaseWorkers[p - 1];
-          std::unique_lock<std::mutex> lk(w.workMtx);
-          w.doneCV.wait(lk, [&w] { return w.done.load(std::memory_order_acquire); });
-        }
-      }
+        processPhases(0);
 
       // Mux phase outputs → high-rate interleaved output.
       for (int p = 0; p < N; p++)
