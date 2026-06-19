@@ -1,18 +1,10 @@
 #pragma once
 
 #include <atomic>
-#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <thread>
-
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__) || defined(__linux__)
-#include <pthread.h>
-#include <sched.h>
-#endif
 
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
@@ -248,16 +240,17 @@ public:
   // cutoffNorm = fc / fs, range (0, 0.5)
   void Design(int order, double cutoffNorm)
   {
+    constexpr double kPi = 3.14159265358979323846;
     const int nSections = order / 2;
     mSections.resize(static_cast<size_t>(nSections));
     mState.assign(static_cast<size_t>(nSections * 2), 0.0);
 
-    const double wd  = std::tan(M_PI * cutoffNorm);
+    const double wd  = std::tan(kPi * cutoffNorm);
     const double wd2 = wd * wd;
 
     for (int k = 0; k < nSections; k++)
     {
-      const double theta = M_PI * (2.0 * k + 1.0 + order) / (2.0 * order);
+      const double theta = kPi * (2.0 * k + 1.0 + order) / (2.0 * order);
       const double Q     = -2.0 * std::cos(theta);
       const double denom = 1.0 + Q * wd + wd2;
       auto& s = mSections[static_cast<size_t>(k)];
@@ -435,11 +428,8 @@ private:
     void _WorkerLoop(int idx)
     {
 #if defined(_WIN32)
-      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#elif defined(__APPLE__) || defined(__linux__)
-      struct sched_param sp;
-      sp.sched_priority = 1;
-      pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+      // THREAD_PRIORITY_ABOVE_NORMAL = 1 above normal
+      ::SetThreadPriority(::GetCurrentThread(), 1 /*THREAD_PRIORITY_ABOVE_NORMAL*/);
 #endif
       int seenGen = 0;
       for (;;)
