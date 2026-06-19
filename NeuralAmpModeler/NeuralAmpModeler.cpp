@@ -338,8 +338,6 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
-  mUpStages.clear();
-  mDownStages.clear();
   {
     std::lock_guard<std::mutex> lock(mSlotWorkerMutex);
     mSlotWorkerStop = true;
@@ -386,11 +384,7 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
     triggerOutput = mNoiseGateTrigger.Process(mInputPointers, numChannelsInternal, numFrames);
   }
 
-  if (!mRawPhaseModels.empty())
-  {
-    _ProcessIIROversample(triggerOutput, mOutputPointers, nFrames);
-  }
-  else if (mModel != nullptr)
+  if (mModel != nullptr)
   {
     if ((int)mModelInF.size() < nFrames) { mModelInF.resize(nFrames); mModelOutF.resize(nFrames); }
     for (int i = 0; i < nFrames; i++) mModelInF[i] = static_cast<NAM_SAMPLE>(triggerOutput[0][i]);
@@ -569,10 +563,8 @@ void NeuralAmpModeler::OnUIOpen()
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
     // Mark as failed only if no model is live or staged (including polyphase path).
     // If loading is still in progress, the completion handler will correct the display.
-    const bool hasLiveModel   = mModel != nullptr || !mRawPhaseModels.empty();
-    const bool hasStagedModel = mStagedModel != nullptr
-                                || !mStagedRawPhaseModels.empty()
-                                || mPhaseModelsReady.load(std::memory_order_acquire);
+    const bool hasLiveModel   = mModel != nullptr;
+    const bool hasStagedModel = mStagedModel != nullptr;
     if (!hasLiveModel && !hasStagedModel)
       SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
   }
@@ -719,11 +711,6 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   if (mShouldRemoveModel)
   {
     mModel = nullptr;
-    mPhaseModels.clear();
-    mRawPhaseModels.clear();
-    mUpStages.clear();
-    mDownStages.clear();
-    mActivePolyphaseN = 1;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
     mModelCleared = true;
@@ -740,41 +727,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   // Move things from staged to live
   if (mStagedModel != nullptr)
   {
-    mPhaseModels.clear();
-    mRawPhaseModels.clear();
-    mUpStages.clear();
-    mDownStages.clear();
-    mActivePolyphaseN = 1;
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
-
-    mNewModelLoadedInDSP = true;
-    _UpdateLatency();
-    _SetInputGain();
-    _SetOutputGain();
-  }
-  if (mPhaseModelsReady.load(std::memory_order_acquire))
-  {
-    mPhaseModelsReady.store(false, std::memory_order_relaxed);
-    mActivePolyphaseN = mStagedPolyphaseN;
-    const int N = mActivePolyphaseN;
-    mModel = nullptr;
-    mPhaseModels = std::move(mStagedPhaseModels);
-    mRawPhaseModels = std::move(mStagedRawPhaseModels);
-    mStagedPhaseModels.clear();
-    mStagedRawPhaseModels.clear();
-
-    // IIR half-band cascade: log2(N) stages of 2x up/downsamplers.
-    // For non-power-of-2 N, round to nearest power of 2 (e.g. 3x → 4x).
-    const int blockSize = GetBlockSize();
-    const int nStages = std::max(1, (int)std::round(std::log2(static_cast<double>(N))));
-    mUpStages.assign(static_cast<size_t>(nStages), HalfBandFilter{});
-    mDownStages.assign(static_cast<size_t>(nStages), HalfBandFilter{});
-    mHiBufA.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
-    mHiBufB.assign(static_cast<size_t>(N * blockSize), NAM_SAMPLE(0));
-    // Prepare single raw model for N×Fs operation (only [0] is used in IIR path).
-    if (!mRawPhaseModels.empty() && mRawPhaseModels[0])
-      mRawPhaseModels[0]->ResetAndPrewarm(GetSampleRate(), N * blockSize);
 
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
@@ -818,28 +772,9 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
 {
   // Model
   if (mStagedModel != nullptr)
-  {
     mStagedModel->Reset(sampleRate, maxBlockSize);
-  }
   else if (mModel != nullptr)
-  {
     mModel->Reset(sampleRate, maxBlockSize);
-  }
-  for (auto& pm : mStagedPhaseModels)
-    if (pm) pm->Reset(sampleRate, maxBlockSize);
-  for (auto& pm : mPhaseModels)
-    if (pm) pm->Reset(sampleRate, maxBlockSize);
-  if (!mStagedRawPhaseModels.empty() && mStagedRawPhaseModels[0])
-    mStagedRawPhaseModels[0]->ResetAndPrewarm(sampleRate, mStagedPolyphaseN * maxBlockSize);
-  if (!mRawPhaseModels.empty() && mRawPhaseModels[0] && !mUpStages.empty())
-  {
-    const int N = mActivePolyphaseN;
-    mRawPhaseModels[0]->ResetAndPrewarm(sampleRate, N * maxBlockSize);
-    for (auto& s : mUpStages)   s.Reset();
-    for (auto& s : mDownStages) s.Reset();
-    mHiBufA.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
-    mHiBufB.assign(static_cast<size_t>(N * maxBlockSize), NAM_SAMPLE(0));
-  }
 
   // IR
   if (mStagedIR != nullptr)
@@ -865,10 +800,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
 void NeuralAmpModeler::_SetInputGain()
 {
   iplug::sample inputGainDB = GetParam(kInputLevel)->Value();
-  // Input calibration — use whichever model is active
   ResamplingNAM* activeModel = mModel.get();
-  if (!activeModel && !mPhaseModels.empty())
-    activeModel = mPhaseModels[0].get(); // metadata ResamplingNAM
   if (activeModel && activeModel->HasInputLevel() && GetParam(kCalibrateInput)->Bool())
     inputGainDB += GetParam(kInputCalibrationLevel)->Value() - activeModel->GetInputLevel();
   mInputGain = DBToAmp(inputGainDB);
@@ -878,8 +810,6 @@ void NeuralAmpModeler::_SetOutputGain()
 {
   double gainDB = GetParam(kOutputLevel)->Value();
   ResamplingNAM* activeModel = mModel.get();
-  if (!activeModel && !mPhaseModels.empty())
-    activeModel = mPhaseModels[0].get();
   if (activeModel != nullptr)
   {
     const int outputMode = GetParam(kOutputMode)->Int();
@@ -921,14 +851,6 @@ void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
   };
   applyWrapped(mModel.get());
   applyWrapped(mStagedModel.get());
-  for (auto& pm : mPhaseModels)
-    applyWrapped(pm.get());
-  for (auto& pm : mStagedPhaseModels)
-    applyWrapped(pm.get());
-  for (auto& pm : mRawPhaseModels)
-    applyRaw(pm.get());
-  for (auto& pm : mStagedRawPhaseModels)
-    applyRaw(pm.get());
 }
 
 void NeuralAmpModeler::_SetSlotParamValue(int paramIdx, int value)
@@ -1071,57 +993,24 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
-    auto wrapModel = [&](std::unique_ptr<nam::DSP> model) -> std::unique_ptr<ResamplingNAM> {
-      if (model->NumInputChannels() != 1)
-        throw std::runtime_error("Model must have 1 input channel, but has "
-                                 + std::to_string(model->NumInputChannels()));
-      if (model->NumOutputChannels() != 1)
-        throw std::runtime_error("Model must have 1 output channel, but has "
-                                 + std::to_string(model->NumOutputChannels()));
-      auto wrapped = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
-      wrapped->Reset(GetSampleRate(), GetBlockSize());
-      if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
-        slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
-      return wrapped;
-    };
+    auto raw = nam::get_dsp(dspPath);
+    if (raw->NumInputChannels() != 1)
+      throw std::runtime_error("Model must have 1 input channel, but has "
+                               + std::to_string(raw->NumInputChannels()));
+    if (raw->NumOutputChannels() != 1)
+      throw std::runtime_error("Model must have 1 output channel, but has "
+                               + std::to_string(raw->NumOutputChannels()));
 
-    if (N > 1)
-    {
-      if (!std::filesystem::exists(dspPath))
-        throw std::runtime_error("Config file doesn't exist!\n");
+    auto wrapped = std::make_unique<ResamplingNAM>(std::move(raw), GetSampleRate(), dspPath);
+    wrapped->SetOversamplingFactor(N);
+    wrapped->SetAntiAliasFilterPhase(dsp::EAntiAliasFilterPhase::MinimumPhaseCascadedFIR);
+    const bool multicoreEnabled = GetParam(kMulticoreEnabled)->Bool();
+    wrapped->SetPhaseMulticoreThreadCount(multicoreEnabled ? NAMPhaseMulticoreHardwareThreads() : 1);
+    wrapped->Reset(GetSampleRate(), GetBlockSize());
+    if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
+      slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
 
-      // N independent raw DSPs at Fs — one per phase, parallelised via worker threads.
-      std::vector<std::unique_ptr<nam::DSP>> newRawModels;
-      newRawModels.reserve(N);
-      for (int p = 0; p < N; p++)
-      {
-        auto raw = nam::get_dsp(dspPath);
-        if (raw->NumInputChannels() != 1 || raw->NumOutputChannels() != 1)
-          throw std::runtime_error("Model must have exactly 1 input and 1 output channel");
-        raw->ResetAndPrewarm(GetSampleRate(), GetBlockSize());
-        if (auto* s = dynamic_cast<nam::SlimmableModel*>(raw.get()))
-          s->SetSlimmableSize(GetParam(kSlim)->Value());
-        newRawModels.push_back(std::move(raw));
-      }
-
-      // 1 ResamplingNAM for metadata only (Loudness, InputLevel, SlimmableModel queries).
-      std::vector<std::unique_ptr<ResamplingNAM>> newPhaseModels;
-      newPhaseModels.push_back(wrapModel(nam::get_dsp(dspPath)));
-
-      mStagedPolyphaseN = N;
-      mPhaseModelsReady.store(false, std::memory_order_relaxed);
-      mStagedPhaseModels = std::move(newPhaseModels);
-      mStagedRawPhaseModels = std::move(newRawModels);
-      mPhaseModelsReady.store(true, std::memory_order_release);
-      mStagedModel = nullptr;
-    }
-    else
-    {
-      mStagedModel = wrapModel(nam::get_dsp(dspPath));
-      mPhaseModelsReady.store(false, std::memory_order_relaxed);
-      mStagedPhaseModels.clear();
-    }
-
+    mStagedModel = std::move(wrapped);
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
   }
@@ -1129,9 +1018,6 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
     mStagedModel = nullptr;
-    mPhaseModelsReady.store(false, std::memory_order_relaxed);
-    mStagedPhaseModels.clear();
-    mStagedRawPhaseModels.clear();
     mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
@@ -1141,9 +1027,6 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
     mStagedModel = nullptr;
-    mPhaseModelsReady.store(false, std::memory_order_relaxed);
-    mStagedPhaseModels.clear();
-    mStagedRawPhaseModels.clear();
     mNAMPath = previousNAMPath;
     return "Unknown error loading DSP module";
   }
@@ -1295,8 +1178,6 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 void NeuralAmpModeler::_UpdateControlsFromModel()
 {
   ResamplingNAM* activeModel = mModel.get();
-  if (!activeModel && !mPhaseModels.empty())
-    activeModel = mPhaseModels[0].get();
   if (activeModel == nullptr)
     return;
   if (auto* pGraphics = GetUI())
@@ -1351,46 +1232,6 @@ void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPoint
 }
 
 
-
-void NeuralAmpModeler::_ProcessIIROversample(iplug::sample** input, iplug::sample** output, int nFrames)
-{
-  const int nStages = static_cast<int>(mUpStages.size());
-
-  // Convert iplug::sample → NAM_SAMPLE, write into mHiBufA (first nFrames entries).
-  for (int i = 0; i < nFrames; i++)
-    mHiBufA[static_cast<size_t>(i)] = static_cast<NAM_SAMPLE>(input[0][i]);
-
-  // Cascade upsample: ping-pong between mHiBufA and mHiBufB.
-  NAM_SAMPLE* cur  = mHiBufA.data();
-  NAM_SAMPLE* alt  = mHiBufB.data();
-  int curN = nFrames;
-  for (int s = 0; s < nStages; s++)
-  {
-    mUpStages[static_cast<size_t>(s)].Upsample2x(cur, alt, curN);
-    curN *= 2;
-    std::swap(cur, alt);
-  }
-  // cur → upsampled high-rate signal (curN = N * nFrames), alt → scratch
-
-  // Single NAM model processes the full high-rate block.
-  NAM_SAMPLE* hiIn  = cur;
-  NAM_SAMPLE* hiOut = alt;
-  mRawPhaseModels[0]->process(&hiIn, &hiOut, curN);
-
-  // Cascade downsample (reverse stage order, same filters).
-  cur = hiOut;
-  alt = hiIn;
-  for (int s = nStages - 1; s >= 0; s--)
-  {
-    curN /= 2;
-    mDownStages[static_cast<size_t>(s)].Downsample2x(cur, alt, curN);
-    std::swap(cur, alt);
-  }
-  // cur → output at base rate (curN = nFrames)
-
-  for (int i = 0; i < nFrames; i++)
-    output[0][i] = static_cast<iplug::sample>(cur[i]);
-}
 
 // HACK
 #include "Unserialization.cpp"
