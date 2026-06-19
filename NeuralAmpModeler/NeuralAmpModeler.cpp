@@ -415,7 +415,9 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   sample** hpfPointers = mHighPass.Process(irPointers, numChannelsInternal, numFrames);
   // sample** lpfPointers = mLowPass.Process(hpfPointers, numChannelsInternal, numFrames);
 
-  // Deferred model swap at zero-crossing of fade-out
+  _ApplyTransitionGain(hpfPointers, numFrames, numChannelsInternal);
+
+  // Deferred model swap after fade-out samples are processed (zero-crossing already applied)
   if (mTransitionFadingOut && mTransitionSamplesRemaining <= 0)
   {
     if (mStagedModel != nullptr)
@@ -431,7 +433,6 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
     mTransitionFadingIn  = true;
     mTransitionSamplesRemaining = mTransitionLength;
   }
-  _ApplyTransitionGain(hpfPointers, numFrames, numChannelsInternal);
 
   // restore previous floating point state
   std::feupdateenv(&fe_state);
@@ -730,6 +731,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   {
     mTransitionFadingOut = false;
     mTransitionFadingIn  = false;
+    mStagedModel = nullptr;
     mModel = nullptr;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
