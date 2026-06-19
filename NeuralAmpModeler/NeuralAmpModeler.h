@@ -1,10 +1,26 @@
 #pragma once
 
+#if defined(_WIN32)
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+  #include <avrt.h>
+  #pragma comment(lib, "Avrt.lib")
+#endif
+
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
@@ -12,14 +28,24 @@
 #include "../AudioDSPTools/dsp/wav.h"
 #include "../AudioDSPTools/dsp/ResamplingContainer/ResamplingContainer.h"
 #include "../NeuralAmpModelerCore/NAM/dsp.h"
+#include "../NeuralAmpModelerCore/NAM/get_dsp.h"
 #include "../NeuralAmpModelerCore/NAM/slimmable.h"
-#include "../iPlug2/IPlug/Extras/LanczosResampler.h"
 
 #include "Colors.h"
 #include "ToneStack.h"
 
 #include "IPlug_include_in_plug_hdr.h"
 #include "ISender.h"
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#if __has_include(<pthread/qos.h>)
+#include <pthread/qos.h>
+#define NAM_HAS_PTHREAD_QOS 1
+#else
+#define NAM_HAS_PTHREAD_QOS 0
+#endif
+#endif
 
 
 const int kNumPresets = 1;
@@ -126,89 +152,217 @@ enum EMsgTags
 // people have used NAM in the past.
 double GetNAMSampleRate(const std::unique_ptr<nam::DSP>& model)
 {
-  // Some models are from when we didn't have sample rate in the model.
-  // For those, this wraps with the assumption that they're 48k models, which is probably true.
   const double assumedSampleRate = 48000.0;
-  const double reportedEncapsulatedSampleRate = model->GetExpectedSampleRate();
-  const double encapsulatedSampleRate =
-    reportedEncapsulatedSampleRate <= 0.0 ? assumedSampleRate : reportedEncapsulatedSampleRate;
-  return encapsulatedSampleRate;
+  const double reported = model->GetExpectedSampleRate();
+  return reported <= 0.0 ? assumedSampleRate : reported;
 };
+
+static inline void NAMConfigurePhaseWorkerThread(int /*workerJobIndex*/)
+{
+#if defined(_WIN32)
+  DWORD taskIndex = 0;
+  HANDLE mmcss = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
+  if (mmcss == nullptr)
+    mmcss = AvSetMmThreadCharacteristicsA("Audio", &taskIndex);
+  if (mmcss != nullptr)
+    AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif defined(__APPLE__)
+#if NAM_HAS_PTHREAD_QOS
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+#endif
+}
+
+class NAMPhaseMulticorePool
+{
+public:
+  explicit NAMPhaseMulticorePool(int totalThreads)
+  {
+    const int workerCount = std::max(0, totalThreads - 1);
+    mWorkers.reserve(static_cast<size_t>(workerCount));
+    for (int i = 0; i < workerCount; i++)
+    {
+      const int workerJobIndex = i + 1;
+      mWorkers.emplace_back([this, workerJobIndex] { WorkerLoop(workerJobIndex); });
+    }
+  }
+
+  ~NAMPhaseMulticorePool()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mMutex);
+      mStop = true;
+      ++mGeneration;
+    }
+    mCV.notify_all();
+    for (auto& t : mWorkers)
+      if (t.joinable()) t.join();
+  }
+
+  int ThreadCount() const { return static_cast<int>(mWorkers.size()) + 1; }
+
+  template <typename Fn>
+  void ParallelFor(int jobCount, Fn&& fn)
+  {
+    if (jobCount <= 1 || mWorkers.empty())
+    {
+      for (int j = 0; j < jobCount; j++) fn(j);
+      return;
+    }
+    const int clamped = std::max(1, std::min(jobCount, ThreadCount()));
+    const int workerJobs = std::max(0, clamped - 1);
+    {
+      std::lock_guard<std::mutex> lock(mMutex);
+      mJob = std::forward<Fn>(fn);
+      mJobCount = clamped;
+      mRemainingWorkers = workerJobs;
+      mDone = (workerJobs == 0);
+      ++mGeneration;
+    }
+    mCV.notify_all();
+    mJob(0);
+    if (workerJobs > 0)
+    {
+      std::unique_lock<std::mutex> lock(mMutex);
+      mDoneCV.wait(lock, [this] { return mDone; });
+    }
+    { std::lock_guard<std::mutex> lock(mMutex); mJob = nullptr; }
+  }
+
+private:
+  void WorkerLoop(int workerJobIndex)
+  {
+    NAMConfigurePhaseWorkerThread(workerJobIndex);
+    int seenGeneration = 0;
+    for (;;)
+    {
+      std::function<void(int)> job;
+      bool shouldRun = false;
+      {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mCV.wait(lock, [this, &seenGeneration] { return mStop || mGeneration != seenGeneration; });
+        if (mStop) return;
+        seenGeneration = mGeneration;
+        shouldRun = workerJobIndex < mJobCount && static_cast<bool>(mJob);
+        if (shouldRun) job = mJob;
+      }
+      if (!shouldRun) continue;
+      job(workerJobIndex);
+      {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mRemainingWorkers > 0) --mRemainingWorkers;
+        if (mRemainingWorkers == 0 && !mDone) { mDone = true; mDoneCV.notify_one(); }
+      }
+    }
+  }
+
+  std::vector<std::thread> mWorkers;
+  std::mutex mMutex;
+  std::condition_variable mCV;
+  std::condition_variable mDoneCV;
+  std::function<void(int)> mJob;
+  int mJobCount = 0;
+  int mRemainingWorkers = 0;
+  int mGeneration = 0;
+  bool mDone = true;
+  bool mStop = false;
+};
+
+static inline int NAMPhaseMulticoreHardwareThreads()
+{
+  const unsigned hw = std::thread::hardware_concurrency();
+  return hw > 0 ? static_cast<int>(hw) : 8;
+}
+
+static inline std::shared_ptr<NAMPhaseMulticorePool> NAMGetPhasePool(int totalThreads)
+{
+  const int maxT = std::max(1, NAMPhaseMulticoreHardwareThreads());
+  const int n = std::max(1, std::min(totalThreads, maxT));
+  static std::mutex poolsMutex;
+  static std::vector<std::shared_ptr<NAMPhaseMulticorePool>> pools;
+  std::lock_guard<std::mutex> lock(poolsMutex);
+  if (static_cast<int>(pools.size()) <= n) pools.resize(static_cast<size_t>(n + 1));
+  if (!pools[static_cast<size_t>(n)]) pools[static_cast<size_t>(n)] = std::make_shared<NAMPhaseMulticorePool>(n);
+  return pools[static_cast<size_t>(n)];
+}
 
 class ResamplingNAM : public nam::DSP
 {
 public:
-  // Resampling wrapper around the NAM models
-  ResamplingNAM(std::unique_ptr<nam::DSP> encapsulated, const double expected_sample_rate)
+  ResamplingNAM(std::unique_ptr<nam::DSP> encapsulated, const double expected_sample_rate,
+                const std::filesystem::path& modelPath = std::filesystem::path())
   : nam::DSP(encapsulated->NumInputChannels(), encapsulated->NumOutputChannels(), expected_sample_rate)
   , mEncapsulated(std::move(encapsulated))
-  , mResampler(GetNAMSampleRate(mEncapsulated))
+  , mModelPath(modelPath)
   {
-    // Assign the encapsulated object's processing function  to this object's member so that the resampler can use it:
-    auto ProcessBlockFunc = [&](NAM_SAMPLE** input, NAM_SAMPLE** output, int numFrames) {
-      mEncapsulated->process(input, output, numFrames);
-    };
-    mBlockProcessFunc = ProcessBlockFunc;
-
-    // Get the other information from the encapsulated NAM so that we can tell the outside world about what we're
-    // holding.
-    if (mEncapsulated->HasLoudness())
-    {
-      SetLoudness(mEncapsulated->GetLoudness());
-    }
-    if (mEncapsulated->HasInputLevel())
-    {
-      SetInputLevel(mEncapsulated->GetInputLevel());
-    }
-    if (mEncapsulated->HasOutputLevel())
-    {
-      SetOutputLevel(mEncapsulated->GetOutputLevel());
-    }
-
-    // NOTE: prewarm samples doesn't mean anything--we can prewarm the encapsulated model as it likes and be good to
-    // go.
-    // _prewarm_samples = 0;
-
-    // And be ready
-    Reset(expected_sample_rate, 2048); // provisional size; overridden by Reset() in _StageModel
+    if (mEncapsulated->HasLoudness()) SetLoudness(mEncapsulated->GetLoudness());
+    if (mEncapsulated->HasInputLevel()) SetInputLevel(mEncapsulated->GetInputLevel());
+    if (mEncapsulated->HasOutputLevel()) SetOutputLevel(mEncapsulated->GetOutputLevel());
+    Reset(expected_sample_rate, 2048);
   };
 
   ~ResamplingNAM() = default;
 
-  void prewarm() override { mEncapsulated->prewarm(); };
+  void prewarm() override
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mEncapsulated->prewarm();
+  };
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override
   {
+    std::lock_guard<std::mutex> lock(mStateMutex);
     if (num_frames > mMaxExternalBlockSize)
-      // We can afford to be careful
-      throw std::runtime_error("More frames were provided than the max expected!");
-
-    if (!NeedToResample())
+      ResetUnlocked(mExternalSampleRate, num_frames);
+    if (!IsResamplingActive())
     {
       mEncapsulated->process(input, output, num_frames);
+      return;
     }
-    else
-    {
-      mResampler.ProcessBlock(input, output, num_frames, mBlockProcessFunc);
-    }
+    mResamplingContainer->ProcessBlock(
+      input, output, num_frames,
+      [this](NAM_SAMPLE** resampledIn, NAM_SAMPLE** resampledOut, int resampledFrames) {
+        if (mPhaseMulticoreActive)
+          ProcessPhaseMulticoreUnlocked(resampledIn, resampledOut, resampledFrames);
+        else
+          mEncapsulated->process(resampledIn, resampledOut, resampledFrames);
+      });
   };
 
-  int GetLatency() const { return NeedToResample() ? mResampler.GetLatency() : 0; };
+  int GetLatency() const
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    return IsResamplingActive() ? mResamplingContainer->GetLatency() : 0;
+  };
+
+  void SetOversamplingFactor(int factor)
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mRequestedOversamplingFactor = factor < 1 ? 1 : factor;
+    if (mEncapsulated) ResetUnlocked(mExternalSampleRate, mMaxExternalBlockSize);
+  };
+
+  void SetAntiAliasFilterPhase(dsp::EAntiAliasFilterPhase filterPhase)
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mAntiAliasFilterPhase = filterPhase;
+    if (mEncapsulated) ResetUnlocked(mExternalSampleRate, mMaxExternalBlockSize);
+  };
+
+  void SetPhaseMulticoreThreadCount(int totalThreads)
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mPhaseMulticoreThreadCount = std::max(1, totalThreads);
+    if (mEncapsulated) ResetUnlocked(mExternalSampleRate, mMaxExternalBlockSize);
+  }
 
   void Reset(const double sampleRate, const int maxBlockSize) override
   {
-    mExpectedSampleRate = sampleRate;
-    mMaxExternalBlockSize = maxBlockSize;
-    mResampler.Reset(sampleRate, maxBlockSize);
-
-    // Allocations in the encapsulated model (HACK)
-    // Stolen some code from the resampler; it'd be nice to have these exposed as methods? :)
-    const double mUpRatio = sampleRate / GetEncapsulatedSampleRate();
-    const auto maxEncapsulatedBlockSize = static_cast<int>(std::ceil(static_cast<double>(maxBlockSize) / mUpRatio));
-    mEncapsulated->ResetAndPrewarm(sampleRate, maxEncapsulatedBlockSize);
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    ResetUnlocked(sampleRate, maxBlockSize);
   };
 
-  // So that we can let the world know if we're resampling (useful for debugging)
   double GetEncapsulatedSampleRate() const { return GetNAMSampleRate(mEncapsulated); };
 
   nam::SlimmableModel* GetSlimmableModel() { return dynamic_cast<nam::SlimmableModel*>(mEncapsulated.get()); }
@@ -217,80 +371,199 @@ public:
     return dynamic_cast<const nam::SlimmableModel*>(mEncapsulated.get());
   }
 
+  void SetSlimmableSize(double value)
+  {
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mSlimmableSize = value;
+    ApplySlimmableSizeUnlocked();
+  }
+
 private:
-  bool NeedToResample() const { return GetExpectedSampleRate() != GetEncapsulatedSampleRate(); };
-  // The encapsulated NAM
+  void ResetUnlocked(const double sampleRate, const int maxBlockSize)
+  {
+    mExpectedSampleRate = sampleRate;
+    mExternalSampleRate = sampleRate;
+    mMaxExternalBlockSize = maxBlockSize;
+
+    const double encapsulatedSampleRate = GetEncapsulatedSampleRate();
+    const double renderingSampleRate = GetRenderingSampleRate(sampleRate);
+    const bool resamplingActive = std::abs(renderingSampleRate - sampleRate) > 1.0e-6;
+    const auto maxEncapsulatedBlockSize =
+      static_cast<int>(std::ceil(maxBlockSize * renderingSampleRate / sampleRate)) + 1;
+    const int timeScale =
+      static_cast<int>(std::max(1.0, std::round(renderingSampleRate / encapsulatedSampleRate)));
+
+    mPhaseMulticoreActive = resamplingActive && mRequestedOversamplingFactor > 1
+                            && timeScale > 1 && !mModelPath.empty()
+                            && mPhaseMulticoreThreadCount > 1;
+    mPhaseCount = mPhaseMulticoreActive ? timeScale : 1;
+
+    if (resamplingActive)
+    {
+      if (mResamplingContainer == nullptr || std::abs(mRenderingSampleRate - renderingSampleRate) > 1.0e-6
+          || std::abs(mResamplingBandwidthSampleRate - encapsulatedSampleRate) > 1.0e-6)
+      {
+        mResamplingContainer = std::make_unique<dsp::ResamplingContainer<NAM_SAMPLE, 1, 32>>(
+          renderingSampleRate, mAntiAliasFilterPhase, encapsulatedSampleRate);
+        mRenderingSampleRate = renderingSampleRate;
+        mResamplingBandwidthSampleRate = encapsulatedSampleRate;
+      }
+      mResamplingContainer->SetAntiAliasFilterPhase(mAntiAliasFilterPhase);
+      mResamplingContainer->Reset(sampleRate, maxBlockSize);
+
+      if (mPhaseMulticoreActive)
+      {
+        const int maxPhaseBlockSize = (maxEncapsulatedBlockSize + mPhaseCount - 1) / mPhaseCount + 1;
+        mEncapsulated->SetTimeScale(1);
+        ApplySlimmableSizeUnlocked();
+        mEncapsulated->ResetAndPrewarm(encapsulatedSampleRate, maxPhaseBlockSize);
+        RebuildPhaseModelsUnlocked(encapsulatedSampleRate, maxPhaseBlockSize);
+        ResizePhaseBuffersUnlocked(maxPhaseBlockSize);
+      }
+      else
+      {
+        ClearPhaseModelsUnlocked();
+        mEncapsulated->SetTimeScale(timeScale);
+        ApplySlimmableSizeUnlocked();
+        mEncapsulated->ResetAndPrewarm(renderingSampleRate, maxEncapsulatedBlockSize);
+      }
+    }
+    else
+    {
+      ClearPhaseModelsUnlocked();
+      mResamplingContainer = nullptr;
+      mRenderingSampleRate = sampleRate;
+      mEncapsulated->SetTimeScale(1);
+      ApplySlimmableSizeUnlocked();
+      mEncapsulated->ResetAndPrewarm(sampleRate, maxBlockSize);
+    }
+  }
+
+  double GetRenderingSampleRate(double externalSampleRate) const
+  {
+    const double encapsulatedSampleRate = GetEncapsulatedSampleRate();
+    if (mRequestedOversamplingFactor <= 1) return encapsulatedSampleRate;
+    const double requestedRendering = externalSampleRate * static_cast<double>(mRequestedOversamplingFactor);
+    const double scale = std::max(1.0, std::round(requestedRendering / encapsulatedSampleRate));
+    return encapsulatedSampleRate * scale;
+  }
+
+  bool IsResamplingActive() const { return mResamplingContainer != nullptr; }
+
+  void RebuildPhaseModelsUnlocked(double encapsulatedSampleRate, int maxPhaseBlockSize)
+  {
+    const int needed = std::max(0, mPhaseCount - 1);
+    while (static_cast<int>(mPhaseModels.size()) < needed)
+    {
+      auto clone = mEncapsulated->CloneForPhase();
+      if (!clone) clone = nam::get_dsp(mModelPath);
+      clone->SetTimeScale(1);
+      if (auto* s = dynamic_cast<nam::SlimmableModel*>(clone.get())) s->SetSlimmableSize(mSlimmableSize);
+      clone->ResetAndPrewarm(encapsulatedSampleRate, maxPhaseBlockSize);
+      mPhaseModels.push_back(std::move(clone));
+    }
+    while (static_cast<int>(mPhaseModels.size()) > needed)
+      mPhaseModels.pop_back();
+
+    for (auto& m : mPhaseModels)
+    {
+      m->SetTimeScale(1);
+      m->ResetAndPrewarm(encapsulatedSampleRate, maxPhaseBlockSize);
+    }
+  }
+
+  void ResizePhaseBuffersUnlocked(int maxPhaseBlockSize)
+  {
+    mPhaseInputBuffers.resize(static_cast<size_t>(mPhaseCount));
+    mPhaseOutputBuffers.resize(static_cast<size_t>(mPhaseCount));
+    for (int p = 0; p < mPhaseCount; p++)
+    {
+      mPhaseInputBuffers[static_cast<size_t>(p)].assign(static_cast<size_t>(maxPhaseBlockSize), NAM_SAMPLE(0));
+      mPhaseOutputBuffers[static_cast<size_t>(p)].assign(static_cast<size_t>(maxPhaseBlockSize), NAM_SAMPLE(0));
+    }
+  }
+
+  void ClearPhaseModelsUnlocked()
+  {
+    mPhaseMulticoreActive = false;
+    mPhaseCount = 1;
+    mPhaseModels.clear();
+    mPhaseInputBuffers.clear();
+    mPhaseOutputBuffers.clear();
+  }
+
+  void ApplySlimmableSizeUnlocked()
+  {
+    if (auto* s = dynamic_cast<nam::SlimmableModel*>(mEncapsulated.get())) s->SetSlimmableSize(mSlimmableSize);
+    for (auto& m : mPhaseModels)
+      if (m)
+        if (auto* s = dynamic_cast<nam::SlimmableModel*>(m.get())) s->SetSlimmableSize(mSlimmableSize);
+  }
+
+  nam::DSP* GetPhaseModelUnlocked(int phase)
+  {
+    return phase == 0 ? mEncapsulated.get() : mPhaseModels[static_cast<size_t>(phase - 1)].get();
+  }
+
+  void ProcessPhaseMulticoreUnlocked(NAM_SAMPLE** resampledInput, NAM_SAMPLE** resampledOutput, int resampledFrames)
+  {
+    if (!mPhaseMulticoreActive || mPhaseCount <= 1)
+    {
+      mEncapsulated->process(resampledInput, resampledOutput, resampledFrames);
+      return;
+    }
+    const int phaseCount = mPhaseCount;
+    const int jobCount = std::max(1, std::min(mPhaseMulticoreThreadCount, phaseCount));
+    const int phasesPerJob = (phaseCount + jobCount - 1) / jobCount;
+    auto pool = NAMGetPhasePool(jobCount);
+    pool->ParallelFor(jobCount, [this, resampledInput, resampledOutput, resampledFrames,
+                                  phaseCount, phasesPerJob](int jobIndex) {
+      const int phaseBegin = jobIndex * phasesPerJob;
+      const int phaseEnd = std::min(phaseCount, phaseBegin + phasesPerJob);
+      for (int phase = phaseBegin; phase < phaseEnd; phase++)
+      {
+        const int phaseFrames =
+          phase < resampledFrames ? ((resampledFrames - phase + phaseCount - 1) / phaseCount) : 0;
+        if (phaseFrames <= 0) continue;
+        nam::DSP* phaseModel = GetPhaseModelUnlocked(phase);
+        if (phaseModel && phaseModel->SupportsStridedProcess())
+        {
+          phaseModel->process_strided(
+            resampledInput[0] + phase, phaseCount, resampledOutput[0] + phase, phaseCount, phaseFrames);
+          continue;
+        }
+        auto& phaseIn  = mPhaseInputBuffers[static_cast<size_t>(phase)];
+        auto& phaseOut = mPhaseOutputBuffers[static_cast<size_t>(phase)];
+        for (int i = 0; i < phaseFrames; i++)
+          phaseIn[static_cast<size_t>(i)] = resampledInput[0][phase + i * phaseCount];
+        NAM_SAMPLE* inPtrs[1]  = {phaseIn.data()};
+        NAM_SAMPLE* outPtrs[1] = {phaseOut.data()};
+        phaseModel->process(inPtrs, outPtrs, phaseFrames);
+        for (int i = 0; i < phaseFrames; i++)
+          resampledOutput[0][phase + i * phaseCount] = phaseOut[static_cast<size_t>(i)];
+      }
+    });
+  }
+
   std::unique_ptr<nam::DSP> mEncapsulated;
+  std::filesystem::path mModelPath;
+  bool mPhaseMulticoreActive = false;
+  int mPhaseCount = 1;
+  int mPhaseMulticoreThreadCount = 1;
+  double mSlimmableSize = 1.0;
+  std::vector<std::unique_ptr<nam::DSP>> mPhaseModels;
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseInputBuffers;
+  std::vector<std::vector<NAM_SAMPLE>> mPhaseOutputBuffers;
+  mutable std::mutex mStateMutex;
 
-  // The resampling wrapper
-  dsp::ResamplingContainer<NAM_SAMPLE, 1, 12> mResampler;
+  std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, 32>> mResamplingContainer;
+  double mRenderingSampleRate = 0.0;
+  double mResamplingBandwidthSampleRate = 0.0;
 
-  // Used to check that we don't get too large a block to process.
   int mMaxExternalBlockSize = 0;
-
-  // This function is defined to conform to the interface expected by the iPlug2 resampler.
-  std::function<void(NAM_SAMPLE**, NAM_SAMPLE**, int)> mBlockProcessFunc;
-};
-
-// 2x IIR half-band polyphase filter (Vaidyanathan structure, 6 first-order allpass
-// sections per branch). Coefficients extracted from reference binary.
-// Allpass: H(z) = (c + z^-1) / (1 + c*z^-1),  y[n] = c*(x[n]-y[n-1]) + x[n-1]
-class HalfBandFilter
-{
-public:
-  // 1 input sample → 2 interleaved output samples (even from branch B, odd from branch A)
-  void Upsample2x(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int numIn)
-  {
-    for (int n = 0; n < numIn; n++)
-    {
-      const double x = static_cast<double>(src[n]);
-      dst[2 * n]     = static_cast<NAM_SAMPLE>(RunBranch(x, kCoeffB, sB));
-      dst[2 * n + 1] = static_cast<NAM_SAMPLE>(RunBranch(x, kCoeffA, sA));
-    }
-  }
-
-  // 2 interleaved input samples → 1 output sample
-  void Downsample2x(const NAM_SAMPLE* src, NAM_SAMPLE* dst, int numOut)
-  {
-    for (int n = 0; n < numOut; n++)
-    {
-      const double ya = RunBranch(static_cast<double>(src[2 * n]),     kCoeffA, sA);
-      const double yb = RunBranch(static_cast<double>(src[2 * n + 1]), kCoeffB, sB);
-      dst[n] = static_cast<NAM_SAMPLE>((ya + yb) * 0.5);
-    }
-  }
-
-  void Reset()
-  {
-    for (int k = 0; k < kSections; k++)
-      sA[k][0] = sA[k][1] = sB[k][0] = sB[k][1] = 0.0;
-  }
-
-private:
-  static constexpr int kSections = 6;
-  // Branch A: downsampler even / upsampler odd
-  static constexpr double kCoeffA[kSections] = {
-    0.136548, 0.423139, 0.677540, 0.839890, 0.931542, 0.987816
-  };
-  // Branch B: downsampler odd / upsampler even
-  static constexpr double kCoeffB[kSections] = {
-    0.036682, 0.274632, 0.561099, 0.769742, 0.892261, 0.962095
-  };
-
-  double sA[kSections][2]{};  // [section][prevIn, prevOut]
-  double sB[kSections][2]{};
-
-  static double RunBranch(double x, const double* c, double s[][2])
-  {
-    for (int k = 0; k < kSections; k++)
-    {
-      const double y = c[k] * (x - s[k][1]) + s[k][0];
-      s[k][0] = x;
-      s[k][1] = y;
-      x = y;
-    }
-    return x;
-  }
+  int mRequestedOversamplingFactor = 1;
+  dsp::EAntiAliasFilterPhase mAntiAliasFilterPhase = dsp::EAntiAliasFilterPhase::MinimumPhaseCascadedFIR;
+  double mExternalSampleRate = 48000.0;
 };
 
 class NeuralAmpModeler final : public iplug::Plugin
@@ -348,7 +621,7 @@ private:
   // re-triggering a slot request (guarded by mSlotParamGuard).
   void _SetSlotParamValue(int paramIdx, int value);
 
-  bool _HaveModel() const { return this->mModel != nullptr || !this->mRawPhaseModels.empty(); };
+  bool _HaveModel() const { return this->mModel != nullptr; };
   // Prepare the input & output buffers
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames);
   // Manage pointers
@@ -368,106 +641,6 @@ private:
   void _SetInputGain();
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
-
-  // IIR cascade oversampling (DLC architecture: single model at N×Fs)
-  void _ProcessIIROversample(iplug::sample** input, iplug::sample** output, int nFrames);
-
-  // Thread pool for parallel phase processing.
-  // One persistent pool per thread count; audio thread always handles job 0.
-  class PhaseMulticorePool
-  {
-  public:
-    explicit PhaseMulticorePool(int totalThreads)
-    {
-      const int workerCount = std::max(0, totalThreads - 1);
-      mWorkers.reserve(static_cast<size_t>(workerCount));
-      for (int i = 0; i < workerCount; i++)
-      {
-        const int workerJobIndex = i + 1;
-        mWorkers.emplace_back([this, workerJobIndex] { _WorkerLoop(workerJobIndex); });
-      }
-    }
-
-    ~PhaseMulticorePool()
-    {
-      { std::lock_guard<std::mutex> lk(mMutex); mStop = true; ++mGeneration; }
-      mCV.notify_all();
-      for (auto& t : mWorkers)
-        if (t.joinable()) t.join();
-    }
-
-    int ThreadCount() const { return static_cast<int>(mWorkers.size()) + 1; }
-
-    template <typename Fn>
-    void ParallelFor(int jobCount, Fn&& fn)
-    {
-      if (jobCount <= 1 || mWorkers.empty()) { for (int j = 0; j < jobCount; j++) fn(j); return; }
-      const int clamped = std::max(1, std::min(jobCount, ThreadCount()));
-      const int workerJobs = std::max(0, clamped - 1);
-      {
-        std::lock_guard<std::mutex> lk(mMutex);
-        mJob = std::forward<Fn>(fn);
-        mJobCount = clamped;
-        mRemainingWorkers = workerJobs;
-        mDone = (workerJobs == 0);
-        ++mGeneration;
-      }
-      mCV.notify_all();
-      mJob(0); // audio thread handles job 0
-      if (workerJobs > 0)
-      {
-        std::unique_lock<std::mutex> lk(mMutex);
-        mDoneCV.wait(lk, [this] { return mDone; });
-      }
-      { std::lock_guard<std::mutex> lk(mMutex); mJob = nullptr; }
-    }
-
-  private:
-    void _WorkerLoop(int idx)
-    {
-#if defined(_WIN32)
-      // THREAD_PRIORITY_ABOVE_NORMAL = 1 above normal
-      ::SetThreadPriority(::GetCurrentThread(), 1 /*THREAD_PRIORITY_ABOVE_NORMAL*/);
-#endif
-      int seenGen = 0;
-      for (;;)
-      {
-        std::function<void(int)> job;
-        bool run = false;
-        {
-          std::unique_lock<std::mutex> lk(mMutex);
-          mCV.wait(lk, [this, &seenGen] { return mStop || mGeneration != seenGen; });
-          if (mStop) return;
-          seenGen = mGeneration;
-          run = idx < mJobCount && static_cast<bool>(mJob);
-          if (run) job = mJob;
-        }
-        if (run) job(idx);
-        {
-          std::lock_guard<std::mutex> lk(mMutex);
-          if (run && --mRemainingWorkers == 0 && !mDone) { mDone = true; mDoneCV.notify_one(); }
-        }
-      }
-    }
-
-    std::vector<std::thread> mWorkers;
-    std::mutex mMutex;
-    std::condition_variable mCV, mDoneCV;
-    std::function<void(int)> mJob;
-    int mJobCount = 0, mRemainingWorkers = 0, mGeneration = 0;
-    bool mDone = true, mStop = false;
-  };
-
-  static std::shared_ptr<PhaseMulticorePool> _GetPhasePool(int totalThreads)
-  {
-    static std::mutex poolsMtx;
-    static std::vector<std::shared_ptr<PhaseMulticorePool>> pools;
-    const int n = std::max(1, std::min(totalThreads, (int)std::thread::hardware_concurrency()));
-    std::lock_guard<std::mutex> lk(poolsMtx);
-    if ((int)pools.size() <= n) pools.resize(static_cast<size_t>(n + 1));
-    if (!pools[n]) pools[n] = std::make_shared<PhaseMulticorePool>(n);
-    return pools[n];
-  }
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -568,26 +741,5 @@ private:
 
   NAMSender mInputSender, mOutputSender;
 
-  // === Polyphase oversampling (N raw DSPs at Fs, sleeping worker threads) ===
-  // Metadata model (ResamplingNAM, 1 when N>1) — NOT in the audio path.
-  std::vector<std::unique_ptr<ResamplingNAM>> mPhaseModels;
-  std::vector<std::unique_ptr<ResamplingNAM>> mStagedPhaseModels;
-  // N raw DSPs for audio processing at Fs, one per phase. Empty = use mModel (1x path).
-  std::vector<std::unique_ptr<nam::DSP>> mRawPhaseModels;
-  std::vector<std::unique_ptr<nam::DSP>> mStagedRawPhaseModels;
-  // Set to true (release) only after staged vectors are fully populated.
-  std::atomic<bool> mPhaseModelsReady{false};
-
-  // Oversampling factor for the active/staged raw models.
-  int mActivePolyphaseN = 1;
-  int mStagedPolyphaseN = 1;
-
-  // IIR half-band cascade up/downsamplers (one stage = 2x).
-  // nStages = log2(N); all stages use identical HalfBandFilter design.
-  std::vector<HalfBandFilter> mUpStages;
-  std::vector<HalfBandFilter> mDownStages;
-  // Ping-pong scratch buffers at high rate (size = N * maxBlockSize).
-  std::vector<NAM_SAMPLE> mHiBufA;
-  std::vector<NAM_SAMPLE> mHiBufB;
-  std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
+  std::vector<NAM_SAMPLE> mModelInF, mModelOutF;
 };
