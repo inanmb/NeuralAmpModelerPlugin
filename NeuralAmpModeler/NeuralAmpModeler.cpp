@@ -1459,7 +1459,6 @@ void NeuralAmpModeler::_StopPhaseWorkers()
 void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** output, int nFrames)
 {
   const int N = mActivePolyphaseN;
-  _EnsurePhaseBuffers(N, nFrames);
 
   // Convert iplug::sample input → NAM_SAMPLE for ResamplingContainer.
   thread_local std::vector<NAM_SAMPLE> inBuf, outBuf;
@@ -1475,38 +1474,59 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
   mOversamplingContainer->ProcessBlock(&inPtr, &outPtr, nFrames,
     [&](NAM_SAMPLE** hiIn, NAM_SAMPLE** hiOut, int hiFrames)
     {
-      const int phaseFrames = hiFrames / N;
+      // Each phase p may have a different frame count when hiFrames % N != 0.
+      // Phase p processes samples at indices p, p+N, p+2N, ...
+      // so phaseFrames(p) = ceil((hiFrames - p) / N) when p < hiFrames, else 0.
+      // This ensures every high-rate sample is consumed — no gaps, no aliasing.
+      const int maxPhaseFrames = (hiFrames + N - 1) / N;
+      _EnsurePhaseBuffers(N, maxPhaseFrames);
 
-      // Stride demux: phase p ← hiIn[0][i*N + p]
       for (int p = 0; p < N; p++)
-        for (int i = 0; i < phaseFrames; i++)
-          mPhaseInputBufs[p][i] = hiIn[0][i * N + p];
+      {
+        const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
+        for (int i = 0; i < pf; i++)
+          mPhaseInputBufs[p][i] = hiIn[0][p + i * N];
+      }
 
       // Process N phases in parallel.
       if (mPhaseWorkers.empty())
       {
         for (int p = 0; p < N; p++)
-          mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], phaseFrames);
+        {
+          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
+          if (pf > 0)
+            mRawPhaseModels[p]->process(&mPhaseInputPtrs[p], &mPhaseOutputPtrs[p], pf);
+        }
       }
       else
       {
         for (int p = 1; p < N; p++)
         {
+          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
+          if (pf <= 0)
+            continue;
           auto& w = *mPhaseWorkers[p - 1];
           {
             std::lock_guard<std::mutex> lk(w.workMtx);
             w.input = &mPhaseInputPtrs[p];
             w.output = &mPhaseOutputPtrs[p];
-            w.numFrames = phaseFrames;
+            w.numFrames = pf;
             w.model = mRawPhaseModels[p].get();
             w.done.store(false, std::memory_order_relaxed);
             w.workReady = true;
           }
           w.workCV.notify_one();
         }
-        mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], phaseFrames);
+        {
+          const int pf0 = hiFrames > 0 ? ((hiFrames + N - 1) / N) : 0;
+          if (pf0 > 0)
+            mRawPhaseModels[0]->process(&mPhaseInputPtrs[0], &mPhaseOutputPtrs[0], pf0);
+        }
         for (int p = 1; p < N; p++)
         {
+          const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
+          if (pf <= 0)
+            continue;
           auto& w = *mPhaseWorkers[p - 1];
           std::unique_lock<std::mutex> lk(w.workMtx);
           w.doneCV.wait(lk, [&w] { return w.done.load(std::memory_order_acquire); });
@@ -1515,8 +1535,11 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
 
       // Mux phase outputs → high-rate interleaved output.
       for (int p = 0; p < N; p++)
-        for (int i = 0; i < phaseFrames; i++)
-          hiOut[0][i * N + p] = mPhaseOutputBufs[p][i];
+      {
+        const int pf = p < hiFrames ? ((hiFrames - p + N - 1) / N) : 0;
+        for (int i = 0; i < pf; i++)
+          hiOut[0][p + i * N] = mPhaseOutputBufs[p][i];
+      }
     });
 
   for (int i = 0; i < nFrames; i++)
