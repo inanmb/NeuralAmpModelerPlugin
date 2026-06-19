@@ -835,7 +835,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
 void NeuralAmpModeler::_SetInputGain()
 {
   iplug::sample inputGainDB = GetParam(kInputLevel)->Value();
-  ResamplingNAM* activeModel = mModel.get();
+  nam::DSP* activeModel = mModel.get();
   if (activeModel && activeModel->HasInputLevel() && GetParam(kCalibrateInput)->Bool())
     inputGainDB += GetParam(kInputCalibrationLevel)->Value() - activeModel->GetInputLevel();
   mInputGain = DBToAmp(inputGainDB);
@@ -844,7 +844,7 @@ void NeuralAmpModeler::_SetInputGain()
 void NeuralAmpModeler::_SetOutputGain()
 {
   double gainDB = GetParam(kOutputLevel)->Value();
-  ResamplingNAM* activeModel = mModel.get();
+  nam::DSP* activeModel = mModel.get();
   if (activeModel != nullptr)
   {
     const int outputMode = GetParam(kOutputMode)->Int();
@@ -878,10 +878,12 @@ void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
   const double v = GetParam(kSlim)->Value();
   auto apply = [v](nam::DSP* p) {
     if (!p) return;
-    nam::DSP* target = p;
+    nam::SlimmableModel* slimmable = nullptr;
     if (auto* r = dynamic_cast<ResamplingNAM*>(p))
-      if (auto* s = r->GetSlimmableModel()) target = s;
-    if (auto* slimmable = dynamic_cast<nam::SlimmableModel*>(target))
+      slimmable = r->GetSlimmableModel();
+    else
+      slimmable = dynamic_cast<nam::SlimmableModel*>(p);
+    if (slimmable)
       slimmable->SetSlimmableSize(v);
   };
   apply(mModel.get());
