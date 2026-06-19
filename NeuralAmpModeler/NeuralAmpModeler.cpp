@@ -783,6 +783,9 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     // Init shared Lanczos upsampler (Fs → N×Fs). Group delay ≈ kPolyphaseA samples.
     mPolyUpsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
       (float)Fs, (float)(N * Fs));
+    // Init Lanczos downsampler (N×Fs → Fs) for anti-aliased reconstruction.
+    mPolyDownsampler = std::make_unique<iplug::LanczosResampler<double, 1, kPolyphaseA>>(
+      (float)(N * Fs), (float)Fs);
 
     // Start N-1 sleeping worker threads (phases 1..N-1).
     // Phase 0 always runs on the audio thread.
@@ -1512,14 +1515,16 @@ void NeuralAmpModeler::_ProcessPolyphase(iplug::sample** input, iplug::sample** 
     }
   }
 
-  // 4. Average N phase outputs → anti-aliased output at Fs.
-  const float invN = 1.0f / static_cast<float>(N);
+  // 4. Interleave N phase outputs → N×Fs buffer, then Lanczos downsample → Fs.
+  const int downLen = N * nFrames;
+  if ((int)mPolyDownBuf.size() < downLen)
+    mPolyDownBuf.assign(downLen, 0.0);
   for (int i = 0; i < nFrames; i++)
-  {
-    float sum = 0.0f;
-    for (int p = 0; p < N; p++) sum += mPhaseOutputBufs[p][i];
-    output[0][i] = static_cast<iplug::sample>(sum * invN);
-  }
+    for (int p = 0; p < N; p++)
+      mPolyDownBuf[i * N + p] = static_cast<double>(mPhaseOutputBufs[p][i]);
+  double* downPtr = mPolyDownBuf.data();
+  mPolyDownsampler->PushBlock(&downPtr, (size_t)downLen);
+  mPolyDownsampler->PopBlock(output, (size_t)nFrames);
 }
 
 // HACK

@@ -454,5 +454,7 @@ private:
   static constexpr int kPolyphaseA = 52;
   std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyUpsampler;
   std::vector<double> mPolyUpBuf;   // N×nFrames upsampled buffer (double)
+  std::unique_ptr<iplug::LanczosResampler<double, 1, kPolyphaseA>> mPolyDownsampler;
+  std::vector<double> mPolyDownBuf; // N×nFrames interleaved buffer for downsampling
   std::vector<NAM_SAMPLE> mModelInF, mModelOutF; // NAM_SAMPLE scratch for 1x path
 };
