@@ -715,14 +715,16 @@ void NeuralAmpModeler::_AllocateIOPointers(const size_t nChans)
 {
   if (mInputPointers != nullptr)
     throw std::runtime_error("Tried to re-allocate mInputPointers without freeing");
-  mInputPointers = new sample*[nChans];
-  if (mInputPointers == nullptr)
-    throw std::runtime_error("Failed to allocate pointer to input buffer!\n");
   if (mOutputPointers != nullptr)
     throw std::runtime_error("Tried to re-allocate mOutputPointers without freeing");
-  mOutputPointers = new sample*[nChans];
-  if (mOutputPointers == nullptr)
-    throw std::runtime_error("Failed to allocate pointer to output buffer!\n");
+  mInputPointers = new sample*[nChans];
+  try {
+    mOutputPointers = new sample*[nChans];
+  } catch (...) {
+    delete[] mInputPointers;
+    mInputPointers = nullptr;
+    throw;
+  }
 }
 
 void NeuralAmpModeler::_ApplyDSPStaging()
@@ -786,15 +788,11 @@ void NeuralAmpModeler::_DeallocateIOPointers()
     delete[] mInputPointers;
     mInputPointers = nullptr;
   }
-  if (mInputPointers != nullptr)
-    throw std::runtime_error("Failed to deallocate pointer to input buffer!\n");
   if (mOutputPointers != nullptr)
   {
     delete[] mOutputPointers;
     mOutputPointers = nullptr;
   }
-  if (mOutputPointers != nullptr)
-    throw std::runtime_error("Failed to deallocate pointer to output buffer!\n");
 }
 
 void NeuralAmpModeler::_FallbackDSP(iplug::sample** inputs, iplug::sample** outputs, const size_t numChannels,
