@@ -700,6 +700,7 @@ private:
   bool mTransitionFadingIn  = false;
   int  mTransitionSamplesRemaining = 0;
   int  mTransitionLength = 0;
+  int  mTransitionPrewarmBlocks = 0;
   // Pending latency value to apply on the UI thread (VST3 requires SetLatency from UI thread).
   // -1 means no pending update.
   std::atomic<int> mPendingLatency{-1};
