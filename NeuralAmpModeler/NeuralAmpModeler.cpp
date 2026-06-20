@@ -428,10 +428,27 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
       _UpdateLatency();
       _SetInputGain();
       _SetOutputGain();
+      // When oversampling is active the new model has IIR filters at zero state.
+      // Defer fade-in by one block so real audio warms the filters before gain rises.
+      mTransitionPrewarmBlocks = (dynamic_cast<ResamplingNAM*>(mModel.get()) != nullptr) ? 1 : 0;
     }
     mTransitionFadingOut = false;
-    mTransitionFadingIn  = true;
-    mTransitionSamplesRemaining = mTransitionLength;
+    if (mTransitionPrewarmBlocks == 0)
+    {
+      mTransitionFadingIn = true;
+      mTransitionSamplesRemaining = mTransitionLength;
+    }
+  }
+
+  // Prewarm: new model already processed real audio this block at gain=0;
+  // start fade-in on next block once IIR filters have had one block to settle.
+  if (mTransitionPrewarmBlocks > 0 && !mTransitionFadingOut)
+  {
+    if (--mTransitionPrewarmBlocks == 0)
+    {
+      mTransitionFadingIn = true;
+      mTransitionSamplesRemaining = mTransitionLength;
+    }
   }
 
   // restore previous floating point state
