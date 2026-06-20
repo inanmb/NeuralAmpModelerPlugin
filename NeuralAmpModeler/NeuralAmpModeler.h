@@ -8,6 +8,9 @@
   #include <avrt.h>
   #pragma comment(lib, "Avrt.lib")
 #endif
+#if defined(__APPLE__)
+  #include <sys/sysctl.h>
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -157,6 +160,17 @@ double GetNAMSampleRate(const std::unique_ptr<nam::DSP>& model)
   return reported <= 0.0 ? assumedSampleRate : reported;
 };
 
+static inline void NAMPhaseMulticoreRealtimePause()
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+  _mm_pause();
+#elif defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)
+  __asm__ volatile("yield");
+#else
+  std::this_thread::yield();
+#endif
+}
+
 static inline void NAMConfigurePhaseWorkerThread(int /*workerJobIndex*/)
 {
 #if defined(_WIN32)
@@ -190,11 +204,8 @@ public:
 
   ~NAMPhaseMulticorePool()
   {
-    {
-      std::lock_guard<std::mutex> lock(mMutex);
-      mStop = true;
-      ++mGeneration;
-    }
+    mStop.store(true, std::memory_order_release);
+    mGeneration.fetch_add(1, std::memory_order_release);
     mCV.notify_all();
     for (auto& t : mWorkers)
       if (t.joinable()) t.join();
@@ -212,61 +223,80 @@ public:
     }
     const int clamped = std::max(1, std::min(jobCount, ThreadCount()));
     const int workerJobs = std::max(0, clamped - 1);
-    {
-      std::lock_guard<std::mutex> lock(mMutex);
-      mJob = std::forward<Fn>(fn);
-      mJobCount = clamped;
-      mRemainingWorkers = workerJobs;
-      mDone = (workerJobs == 0);
-      ++mGeneration;
-    }
+    using JobType = std::remove_reference_t<Fn>;
+    JobType job = std::forward<Fn>(fn);
+
+    mJobContext = &job;
+    mJobInvoker = [](void* ctx, int idx) { (*static_cast<JobType*>(ctx))(idx); };
+    mJobCount = clamped;
+    mCompletedWorkers.store(0, std::memory_order_relaxed);
+    mGeneration.fetch_add(1, std::memory_order_release);
     mCV.notify_all();
-    mJob(0);
+
+    job(0);
+
     if (workerJobs > 0)
     {
-      std::unique_lock<std::mutex> lock(mMutex);
-      mDoneCV.wait(lock, [this] { return mDone; });
+      int spins = 0;
+      while (mCompletedWorkers.load(std::memory_order_acquire) < workerJobs)
+      {
+        NAMPhaseMulticoreRealtimePause();
+        if (++spins >= 16384) { spins = 0; std::this_thread::yield(); }
+      }
     }
-    { std::lock_guard<std::mutex> lock(mMutex); mJob = nullptr; }
+    mJobContext = nullptr;
+    mJobInvoker = nullptr;
   }
 
 private:
   void WorkerLoop(int workerJobIndex)
   {
     NAMConfigurePhaseWorkerThread(workerJobIndex);
-    int seenGeneration = 0;
+    unsigned seenGeneration = 0;
+    int idleSpins = 0;
     for (;;)
     {
-      std::function<void(int)> job;
-      bool shouldRun = false;
+      unsigned gen = mGeneration.load(std::memory_order_acquire);
+      if (gen == seenGeneration)
       {
+        if (mStop.load(std::memory_order_acquire)) return;
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+        if (idleSpins++ < 262144) { NAMPhaseMulticoreRealtimePause(); continue; }
+        {
+          std::unique_lock<std::mutex> lock(mMutex);
+          mCV.wait_for(lock, std::chrono::microseconds(500), [this, seenGeneration] {
+            return mStop.load(std::memory_order_acquire)
+                   || mGeneration.load(std::memory_order_acquire) != seenGeneration;
+          });
+        }
+        idleSpins = 0;
+#else
         std::unique_lock<std::mutex> lock(mMutex);
-        mCV.wait(lock, [this, &seenGeneration] { return mStop || mGeneration != seenGeneration; });
-        if (mStop) return;
-        seenGeneration = mGeneration;
-        shouldRun = workerJobIndex < mJobCount && static_cast<bool>(mJob);
-        if (shouldRun) job = mJob;
+        mCV.wait(lock, [this, &seenGeneration] {
+          return mStop.load(std::memory_order_acquire)
+                 || mGeneration.load(std::memory_order_acquire) != seenGeneration;
+        });
+#endif
+        continue;
       }
-      if (!shouldRun) continue;
-      job(workerJobIndex);
-      {
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (mRemainingWorkers > 0) --mRemainingWorkers;
-        if (mRemainingWorkers == 0 && !mDone) { mDone = true; mDoneCV.notify_one(); }
-      }
+      seenGeneration = gen;
+      idleSpins = 0;
+      if (mStop.load(std::memory_order_acquire)) return;
+      if (workerJobIndex < mJobCount && mJobContext && mJobInvoker)
+        mJobInvoker(mJobContext, workerJobIndex);
+      mCompletedWorkers.fetch_add(1, std::memory_order_release);
     }
   }
 
   std::vector<std::thread> mWorkers;
   std::mutex mMutex;
   std::condition_variable mCV;
-  std::condition_variable mDoneCV;
-  std::function<void(int)> mJob;
+  void* mJobContext = nullptr;
+  void (*mJobInvoker)(void*, int) = nullptr;
   int mJobCount = 0;
-  int mRemainingWorkers = 0;
-  int mGeneration = 0;
-  bool mDone = true;
-  bool mStop = false;
+  std::atomic<int> mCompletedWorkers{0};
+  std::atomic<unsigned> mGeneration{0};
+  std::atomic<bool> mStop{false};
 };
 
 static inline int NAMPhaseMulticoreHardwareThreads()
@@ -275,9 +305,45 @@ static inline int NAMPhaseMulticoreHardwareThreads()
   return hw > 0 ? static_cast<int>(hw) : 8;
 }
 
+static inline bool NAMPhaseMulticoreIsAppleSilicon()
+{
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+  return true;
+#else
+  return false;
+#endif
+}
+
+static inline int NAMPhaseMulticoreApplePerformanceCoreCount()
+{
+#if defined(__APPLE__) && defined(NAM_HAS_PTHREAD_QOS)
+  int count = 0;
+  size_t size = sizeof(count);
+  if (sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nullptr, 0) == 0 && count > 0)
+    return count;
+#endif
+  return 0;
+}
+
+static inline int NAMPhaseMulticoreSmartAutoThreadCount()
+{
+  const int hw = NAMPhaseMulticoreHardwareThreads();
+  int total = std::max(hw >= 8 ? 4 : 2, hw - 1);
+  total = std::max(1, std::min(total, 64));
+  if (NAMPhaseMulticoreIsAppleSilicon())
+  {
+    const int perfCores = NAMPhaseMulticoreApplePerformanceCoreCount();
+    const int cap = perfCores > 0 ? perfCores : 8;
+    total = std::min(total, cap);
+    if (hw > 2) total = std::min(total, hw - 2);
+    total = std::max(1, std::min(total, 64));
+  }
+  return total;
+}
+
 static inline std::shared_ptr<NAMPhaseMulticorePool> NAMGetPhasePool(int totalThreads)
 {
-  const int maxT = std::max(1, NAMPhaseMulticoreHardwareThreads());
+  const int maxT = std::max(1, NAMPhaseMulticoreSmartAutoThreadCount());
   const int n = std::max(1, std::min(totalThreads, maxT));
   static std::mutex poolsMutex;
   static std::vector<std::shared_ptr<NAMPhaseMulticorePool>> pools;
