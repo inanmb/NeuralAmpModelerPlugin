@@ -604,6 +604,7 @@ public:
   {
     AddChildControl(new IVLabelControl(GetRECT().SubRectVertical(4, 0), "Model information:", mStyle));
     AddNamedChildControl(new IVLabelControl(GetRECT().SubRectVertical(4, 1), "", mStyle), mControlNames.sampleRate);
+    AddChildControl(new IVLabelControl(GetRECT().SubRectVertical(4, 2), "Build: " __DATE__ " " __TIME__, mStyle));
     // AddNamedChildControl(
     //   new IVLabelControl(GetRECT().SubRectVertical(4, 2), "", mStyle), mControlNames.inputCalibrationLevel);
     // AddNamedChildControl(
