@@ -237,11 +237,16 @@ public:
 
     if (workerJobs > 0)
     {
+#if defined(_WIN32)
+      const int spinLimit = std::clamp(65536 / std::max(1, workerJobs), 512, 8192);
+#else
+      const int spinLimit = 16384;
+#endif
       int spins = 0;
       while (mCompletedWorkers.load(std::memory_order_acquire) < workerJobs)
       {
         NAMPhaseMulticoreRealtimePause();
-        if (++spins >= 16384) { spins = 0; std::this_thread::yield(); }
+        if (++spins >= spinLimit) { spins = 0; std::this_thread::yield(); }
       }
     }
     mJobContext = nullptr;
