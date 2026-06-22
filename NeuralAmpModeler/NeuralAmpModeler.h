@@ -240,7 +240,7 @@ public:
 #if defined(_WIN32)
       const int spinLimit = std::clamp(65536 / std::max(1, workerJobs), 512, 8192);
 #else
-      const int spinLimit = 16384;
+      const int spinLimit = std::clamp(65536 / std::max(1, workerJobs), 512, 8192);
 #endif
       int spins = 0;
       while (mCompletedWorkers.load(std::memory_order_acquire) < workerJobs)
@@ -528,6 +528,7 @@ private:
     {
       auto clone = mEncapsulated->CloneForPhase();
       if (!clone) clone = nam::get_dsp(mModelPath);
+      if (!clone) break;
       clone->SetTimeScale(1);
       if (auto* s = dynamic_cast<nam::SlimmableModel*>(clone.get())) s->SetSlimmableSize(mSlimmableSize);
       clone->ResetAndPrewarm(encapsulatedSampleRate, maxPhaseBlockSize);
