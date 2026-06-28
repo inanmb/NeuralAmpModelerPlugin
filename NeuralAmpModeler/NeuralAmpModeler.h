@@ -755,6 +755,8 @@ private:
   std::unique_ptr<nam::DSP> mModel;
   // And the IR
   std::unique_ptr<dsp::ImpulseResponse> mIR;
+  // Set to true by OnParamChange when a new slot is requested while staging is in progress.
+  std::atomic<bool> mStageCancelled{false};
   // Manages switching what DSP is being used.
   std::unique_ptr<nam::DSP> mStagedModel;
   std::unique_ptr<dsp::ImpulseResponse> mStagedIR;

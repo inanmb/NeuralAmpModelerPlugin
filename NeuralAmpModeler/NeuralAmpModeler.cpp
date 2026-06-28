@@ -647,6 +647,7 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
           const int slotNum = paramIdx - kCallSlot1 + 1;
           if ((int)GetParam(paramIdx)->Value() == 1)
           {
+            mStageCancelled.store(true);
             mSlotLoadRequest.store(slotNum);
             mSlotWorkerCV.notify_one();
           }
@@ -934,7 +935,9 @@ void NeuralAmpModeler::_SlotWorkerFunc()
     }
     // Brief debounce so that a burst of parameter changes (e.g. a host
     // preset switch) settles before we act on the last request.
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    // Slot switches are intentional: short debounce. OS/multicore reloads (-1) keep longer settle.
+    const int debounceMs = (mSlotLoadRequest.load() > 0) ? 10 : 80;
+    std::this_thread::sleep_for(std::chrono::milliseconds(debounceMs));
     try { _ProcessSlotRequests(); }
     catch (...) {}
   }
@@ -1041,6 +1044,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
 
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
+  mStageCancelled.store(false);
   WDL_String previousNAMPath = mNAMPath;
   try
   {
@@ -1048,6 +1052,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
     auto raw = nam::get_dsp(dspPath);
+    if (mStageCancelled.load()) return "";
     if (raw->NumInputChannels() != 1)
       throw std::runtime_error("Model must have 1 input channel, but has "
                                + std::to_string(raw->NumInputChannels()));
@@ -1064,6 +1069,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
       const bool multicoreEnabled = GetParam(kMulticoreEnabled)->Bool();
       wrapped->SetPhaseMulticoreThreadCount(multicoreEnabled ? NAMPhaseMulticoreHardwareThreads() : 1);
       wrapped->Reset(GetSampleRate(), GetBlockSize());
+      if (mStageCancelled.load()) return "";
       if (nam::SlimmableModel* slimmable = wrapped->GetSlimmableModel())
         slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
       model = std::move(wrapped);
