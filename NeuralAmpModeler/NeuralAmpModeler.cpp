@@ -928,7 +928,9 @@ void NeuralAmpModeler::_SlotWorkerFunc()
     {
       std::unique_lock<std::mutex> lock(mSlotWorkerMutex);
       mSlotWorkerCV.wait(lock, [this]() {
-        return mSlotWorkerStop || mSlotLoadRequest.load() != 0 || mSlotAssignRequest.load() > 0;
+        return mSlotWorkerStop || mSlotLoadRequest.load() != 0
+                               || mSlotAssignRequest.load() > 0
+                               || mNeedsOSRestage.load();
       });
       if (mSlotWorkerStop)
         return;
@@ -971,6 +973,20 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   }
 
   const int req = mSlotLoadRequest.exchange(0);
+
+  // OS re-stage pending and no new slot request: re-stage with full oversampling
+  if (req == 0 && mNeedsOSRestage.load())
+  {
+    mNeedsOSRestage.store(false);
+    const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
+    if (N > 1 && mNAMPath.GetLength())
+    {
+      std::lock_guard<std::mutex> lock(mStageMutex);
+      _StageModel(mNAMPath);
+    }
+    return;
+  }
+
   if (req == 0)
     return;
   // -1 = reload current model with updated oversampling factor
@@ -1019,8 +1035,12 @@ void NeuralAmpModeler::_ProcessSlotRequests()
     ok = _StageModel(s.namPath, /*noOversampling=*/N > 1).empty();
     if (ok && N > 1)
     {
-      mSlotLoadRequest.store(-1); // re-stage with OS once 1x model is live
-      mSlotWorkerCV.notify_one(); // wake the worker: store from within worker thread won't self-notify
+      mNeedsOSRestage.store(true);
+      mSlotWorkerCV.notify_one();
+    }
+    else
+    {
+      mNeedsOSRestage.store(false);
     }
   }
 
