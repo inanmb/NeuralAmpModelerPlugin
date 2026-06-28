@@ -1018,7 +1018,10 @@ void NeuralAmpModeler::_ProcessSlotRequests()
     std::lock_guard<std::mutex> lock(mStageMutex);
     ok = _StageModel(s.namPath, /*noOversampling=*/N > 1).empty();
     if (ok && N > 1)
+    {
       mSlotLoadRequest.store(-1); // re-stage with OS once 1x model is live
+      mSlotWorkerCV.notify_one(); // wake the worker: store from within worker thread won't self-notify
+    }
   }
 
   // Load IR if different
