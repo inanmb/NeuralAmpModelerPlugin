@@ -109,6 +109,11 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
   {
     _StageIR(mIRPath);
   }
+  if (mNAMPath.GetLength())
+  {
+    mNeedsOSRestage.store(true);
+    mSlotWorkerCV.notify_one();
+  }
 }
 
 // Unserialize NAM Path, IR path, then named keys
