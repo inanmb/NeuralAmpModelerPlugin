@@ -936,7 +936,7 @@ void NeuralAmpModeler::_SlotWorkerFunc()
     // Brief debounce so that a burst of parameter changes (e.g. a host
     // preset switch) settles before we act on the last request.
     // Slot switches are intentional: short debounce. OS/multicore reloads (-1) keep longer settle.
-    const int debounceMs = (mSlotLoadRequest.load() > 0) ? 10 : 80;
+    const int debounceMs = (mSlotLoadRequest.load() > 0) ? 10 : 50;
     std::this_thread::sleep_for(std::chrono::milliseconds(debounceMs));
     try { _ProcessSlotRequests(); }
     catch (...) {}
@@ -1014,8 +1014,11 @@ void NeuralAmpModeler::_ProcessSlotRequests()
   bool ok = true;
   if (strcmp(s.namPath.Get(), mNAMPath.Get()) != 0)
   {
+    const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
     std::lock_guard<std::mutex> lock(mStageMutex);
-    ok = _StageModel(s.namPath).empty();
+    ok = _StageModel(s.namPath, /*noOversampling=*/N > 1).empty();
+    if (ok && N > 1)
+      mSlotLoadRequest.store(-1); // re-stage with OS once 1x model is live
   }
 
   // Load IR if different
@@ -1042,13 +1045,13 @@ void NeuralAmpModeler::_ProcessSlotRequests()
 }
 
 
-std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
+std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath, bool noOversampling)
 {
   mStageCancelled.store(false);
   WDL_String previousNAMPath = mNAMPath;
   try
   {
-    const int N = kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
+    const int N = noOversampling ? 1 : kOversamplingFactorValues[GetParam(kOversamplingFactor)->Int()];
     auto dspPath = std::filesystem::u8path(modelPath.Get());
 
     auto raw = nam::get_dsp(dspPath);
