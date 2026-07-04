@@ -64,6 +64,16 @@ enum EParams
   kCallSlot8,
   kCallSlot9,
   kCallSlot10,
+  kCallSlot11,
+  kCallSlot12,
+  kCallSlot13,
+  kCallSlot14,
+  kCallSlot15,
+  kCallSlot16,
+  kCallSlot17,
+  kCallSlot18,
+  kCallSlot19,
+  kCallSlot20,
   // Assign: press button N to save current full state into slot N (auto-resets to 0)
   kAssignSlot1,
   kAssignSlot2,
@@ -75,10 +85,20 @@ enum EParams
   kAssignSlot8,
   kAssignSlot9,
   kAssignSlot10,
+  kAssignSlot11,
+  kAssignSlot12,
+  kAssignSlot13,
+  kAssignSlot14,
+  kAssignSlot15,
+  kAssignSlot16,
+  kAssignSlot17,
+  kAssignSlot18,
+  kAssignSlot19,
+  kAssignSlot20,
   kNumParams
 };
 
-const int kNumModelSlots = 10;
+const int kNumModelSlots = 20;
 
 const int numKnobs = 6;
 

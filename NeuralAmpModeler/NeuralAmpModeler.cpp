@@ -583,7 +583,7 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     default:
       if (!mSlotParamGuard.load())
       {
-        if (paramIdx >= kCallSlot1 && paramIdx <= kCallSlot10)
+        if (paramIdx >= kCallSlot1 && paramIdx <= kCallSlot20)
         {
           const int slotNum = paramIdx - kCallSlot1 + 1;
           if ((int)GetParam(paramIdx)->Value() == 1)
@@ -592,7 +592,7 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
             mSlotWorkerCV.notify_one();
           }
         }
-        else if (paramIdx >= kAssignSlot1 && paramIdx <= kAssignSlot10)
+        else if (paramIdx >= kAssignSlot1 && paramIdx <= kAssignSlot20)
         {
           if ((int)GetParam(paramIdx)->Value() == 1)
           {
@@ -869,7 +869,7 @@ void NeuralAmpModeler::_ProcessSlotRequests()
     // Capture all params except the slot-control params
     for (int i = 0; i < kNumParams; i++)
     {
-      if ((i >= kCallSlot1 && i <= kCallSlot10) || (i >= kAssignSlot1 && i <= kAssignSlot10))
+      if ((i >= kCallSlot1 && i <= kCallSlot20) || (i >= kAssignSlot1 && i <= kAssignSlot20))
         continue;
       s.params[GetParam(i)->GetName()] = GetParam(i)->Value();
     }
